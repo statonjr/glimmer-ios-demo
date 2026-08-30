@@ -1,0 +1,531 @@
+#+title: glitter-ios-demo
+#+author: Larry Staton
+#+date: 30 August 2026
+
+* Introduction
+
+An experiment: run a [[https://github.com/burinc/glitter][glitter]] app on iOS, with a renderer over *UIKit* the way
+[[https://github.com/burinc/glitter-uikit][glitter-uikit]] renders over AppKit — same reconciler, same hiccup, same
+state-atom pattern, a new toolkit behind the seam. The goal of the first
+milestone is deliberately small: the counter from
+[[https://github.com/statonjr/glitter-uikit-demo][glitter-uikit-demo]], running in the iOS Simulator, with its state/view/actions
+code *unchanged except the requires*.
+
+Nobody in #jolt has tried iOS yet; Android has been demonstrated (differently
+— see below). This notebook starts as the research that says the attempt is
+worth making, and will accrete the experiment as it happens, in the same
+literate style as the macOS demo: prose first, mistakes kept, code tangled
+from this document once there is code to tangle.
+
+* Research findings (2026-08-30)
+
+** Chez officially targets iOS
+
+Mainline Chez Scheme 10's [[https://github.com/cisco/ChezScheme/blob/main/BUILDING][BUILDING]] documents a =tarm64ios= machine type with
+a cross-compile recipe:
+
+#+begin_example
+./configure \
+  --cross \
+  -m=tarm64ios \
+  CFLAGS="-arch arm64 -isysroot $(xcrun -sdk iphoneos --show-sdk-path) -DTARGET_OS_IPHONE=1 -DDISABLE_CURSES" \
+  LDFLAGS="-liconv" \
+  CC_FOR_BUILD=clang
+make
+#+end_example
+
+So the runtime jolt stands on already knows how to be an iOS binary. Chez
+also has the =pb= (portable bytecode) backend — which turns out to be the
+key to shipping (next section).
+
+** The one architectural wall: W^X
+
+This explains why Android already works and iOS is unproven. Chez's native
+machine types load compiled boot images into /executable memory at runtime/.
+Android permits that. iOS forbids runtime code creation for App Store apps —
+no JIT entitlement. Three escape hatches, in increasing shippability:
+
+1. *The Simulator* — JIT is allowed; everything behaves as on macOS. All
+   development happens here.
+2. *A dev-signed device with the debugger attached* — JIT is effectively
+   available; fine for personal builds.
+3. *The =pb= backend* — bytecode interpreted by the signed C kernel is
+   /data/, not code, and therefore App Store-legal. This is exactly how
+   Racket CS ships on iOS. Roughly 2–5× slower than native Chez; immaterial
+   for a UI app. (App Store rule 2.5.2 permits interpreting code /bundled
+   with/ the app; downloading new code is what's banned — so an on-device
+   nREPL stays a dev-only feature.)
+
+** The Android precedent — a different architecture
+
+[[https://github.com/jasalt/jolt-android-experiment][jasalt/jolt-android-experiment]] (branch =master=) validates a lot: reproducible
+cross-builds of Chez + a reduced jolt as an =arm64-v8a= shared library,
+single-runtime-thread confinement, lifecycle survival, effects executed
+through Android APIs, a bounded debug-eval path. Its README explicitly names
+"a plausible shared-runtime path across Android and Apple platforms."
+
+But its shape is *embedded-core*: jolt runs portable domain logic; the UI is
+native Kotlin/Compose; events and effects cross a JNI boundary as data. That
+is option A below — proven, and different from what this project attempts.
+
+** Two architectures
+
+A third arrived the same day, and supersedes both — see
+[[*Option C — a backend, not a renderer port][Option C]].
+
+- *Option A — embedded core* (the Android experiment's shape): jolt/Chez as a
+  static library; a Swift/UIKit shell owns the UI; events in, effect data
+  out, across a C boundary. Pros: Xcode owns packaging and signing; no ObjC
+  runtime gymnastics; matches the proven Android path, so domain code shares
+  across all platforms. Cons: the UI is not hiccup; you write Swift.
+- *Option B — the renderer swap* (this project): port glitter-uikit's four
+  namespaces to UIKit, so hiccup drives real =UIButton=​s. The audit below
+  says most of it is mechanical.
+
+** The renderer-port audit (option B)
+
+Superseded the same day by [[*Option C — a backend, not a renderer port][Option C]], and kept: it is
+still the best inventory of what the Objective-C layer has to do, and the wall
+it missed is recorded in [[*The GTK4 wall the audit missed][the section that found it]].
+
+Namespace by namespace, against glitter-uikit as it stands:
+
+| namespace              | verdict                                                                    |
+|------------------------+----------------------------------------------------------------------------|
+| =ffi.clj=              | ~90% verbatim. Same ObjC runtime, same =objc_msgSend= arm64 ABI, same HFA struct-flattening rule, same CoreFoundation. Change the dlopen path to UIKit.framework and the enum constants. |
+| =app.clj=              | The CFRunLoopSource scheduler ports *verbatim* (CoreFoundation is identical on iOS). The bootstrap changes: =UIApplicationMain(argc, argv, nil, "GlitterAppDelegate")= replaces =[NSApp run]= and never returns; the delegate class is built at runtime with =objc_allocateClassPair= + foreign-callable IMPs — exactly glitter-uikit's GlitterTarget pattern, plus =application:didFinishLaunchingWithOptions:= (create =UIWindow= + root view controller, call on-activate). Omitting the scene manifest from Info.plist keeps the legacy delegate lifecycle. |
+| =widget.clj=           | =UIStackView= ≈ =NSStackView= (axis/spacing/distribution), so =:vbox=​/​=:hbox= port near-verbatim. =UILabel.attributedText= takes the existing markup pipeline. =UIButton= wires via =addTarget:action:forControlEvents:= — richer than NSControl's single action slot, and the pointer-keyed handler registry still fits. =UITextField= → editingChanged. |
+| =appkit.clj= (renderer) | Mostly verbatim — it talks to the widget layer, not to AppKit. |
+
+Design inversions to expect:
+
+- No multi-window: the macOS demo's hub-opens-windows becomes a
+  =UINavigationController= push — the "swap content in place" branch not
+  taken on macOS is the iOS-correct one.
+- UIKit's main-thread checker is stricter than AppKit's; the =on-gui=
+  discipline glitter-uikit already enforces carries over unchanged.
+- Bonus: a UIKit renderer gets *Mac Catalyst* nearly free — UIKit-on-Mac is
+  Apple's own supported configuration.
+
+** The real unknown: =jolt build= cross-targeting
+
+jolt's build pipeline (emit Scheme → Chez =compile-file=​/​=make-boot-file= →
+embed the boot as C bytes → cc-link against =libkernel.a=) is /shaped/ right
+— the cc-link step is exactly where =-target arm64-apple-ios -isysroot ...=
+goes, and the compile step is where =tarm64ios= (or =pb=) would be selected.
+But nothing suggests =jolt build= exposes a cross-target flag today, and the
+Android experiment drove Chez directly with a reduced jolt library — which
+hints that it doesn't. *This is the question for Dmitri in #jolt.* Also
+publicly untested: jolt on the =pb= backend at all (jolt requires a threaded
+Chez; a threaded =pb= variant exists).
+
+Answered the same evening, by =jolt --help= rather than by Dmitri — see
+[[*The real unknown was in =jolt --help= (2026-08-30, later)][below]].
+
+* The strategy changes: the reactive core came out (2026-08-30)
+
+Dmitri, in #jolt, hours after the research above was written:
+
+#+begin_quote
+yup, I factored out the reactive core, so now it's trivial to hook into any
+native lib that offers up C ABI
+#+end_quote
+
+Read against the audit, that sentence does three things: it removes a wall the
+audit never saw, it demotes the port from a renderer swap to a /backend/, and —
+followed one repository further — it turns out most of what the audit proposed
+to write already exists.
+
+** The GTK4 wall the audit missed
+
+The audit went namespace by namespace through glitter-uikit and never opened
+=deps.edn=. glitter-uikit's own says why that was a mistake:
+
+#+begin_quote
+KNOWN LIMITATION: glitter's own deps.edn declares GTK4/GLib/GObject/GIO under
+=:jolt/native=, and jolt inherits a dependency's natives transitively and
+hard-fails in =load-natives!= before any namespace loads when one is missing.
+So GTK4 must be installed to run anything here, even though this renderer never
+calls a GTK function. Verified live, including that an =:aliases=-scoped
+=:jolt/native= is silently ignored, so there is no way to scope it away.
+#+end_quote
+
+The macOS notebook already records the consequence — its Dependencies section
+tells you to =brew install gtk4= for an app that renders pure AppKit. On macOS
+that is a wart. On iOS it is fatal: there is no GTK4 in an =.ipa=, the natives
+load before any namespace is required, and no alias can scope them away.
+Milestone 4 needs =glitter.core=, which needs the glitter dep, which needs four
+dylibs that cannot exist on the device.
+
+That same comment names the fix — "extracting a natives-free glitter-core the
+way upstream glimmer did at v0.1.0" — which is exactly what Dmitri's message
+announces, one project over.
+
+** glimmer v0.1.0: the core came out clean
+
+=jolt-lang/glimmer= at v0.1.0 (=5581c331=), the whole of its =deps.edn=:
+
+#+begin_src clojure :tangle no
+{:paths ["src"]
+ ;; No dependencies, native or otherwise: glimmer is the portable half of the
+ ;; toolkit — reactive cells, the component model and the reconciler.
+ :deps {}
+ :aliases {:test {:extra-paths ["test"] :main-opts ["-m" "glimmer.test-runner"]}}}
+#+end_src
+
+Three namespaces, 803 lines: =glimmer.ratom= (reactive cells with automatic
+dependency tracking), =glimmer.backend= (the seam), =glimmer.core= (component
+model, positional and keyed reconciliation, mount/unmount). The whole suite runs
+headless against an in-memory mock backend. The wall is gone, not climbed.
+
+** The seam is nine functions
+
+A backend is a plain map, five keys required:
+
+#+begin_src clojure :tangle no
+{:name           :uikit
+ :create!        (fn [tag props] widget)      ; construct, apply props, wire events
+ :apply-props!   (fn [tag widget props])      ; re-apply on re-render
+ :append-child!  (fn [parent-tag parent child])
+ :remove-child!  (fn [parent-tag parent child])
+ :replace-child! (fn [parent-tag parent old new])
+ ;; optional
+ :reorder-child! (fn [parent-tag parent child sibling])
+ :schedule       (fn [work])                  ; run a thunk on the UI thread
+ :run            (fn [opts mount-root!])      ; the event loop
+ :text->element  (fn [s] hiccup)}             ; default [:label {:label s}]
+#+end_src
+
+A widget is whatever the backend says it is — a pointer, a record, a map; the
+core never inspects one, it only hands it back. Two of the optional keys are
+shaped for precisely the problems the audit flagged:
+
+- =:schedule=, paired with =glimmer.backend/loop-running?=, /is/ the =on-gui=
+  discipline, already factored out as a backend concern rather than something a
+  renderer must re-invent.
+- =:run= takes =(fn [opts mount-root!])=, and its contract is: create a
+  top-level container, call =(mount-root! container tag)=, then run the event
+  loop, blocking. glimmer-gtk calls =mount-root!= from inside its =activate=
+  foreign-callable — /within/ the running loop.
+
+That second one matters more than it looks. glitter-uikit's =app.clj= carries a
+long CORRECTION (P4.T4, 2026-08-20) about AppKit calling =on-activate= eagerly,
+before the loop starts, unlike glitter.gtk's signal-driven one. iOS is the GTK
+shape, not the AppKit shape: =application:didFinishLaunchingWithOptions:= fires
+from inside =UIApplicationMain=. Under glimmer that is not an inversion to port
+around — it is what the contract already expects. =mount-root!= even takes a tag
+alongside the container, so nothing in the core assumes a window.
+
+** Option C — a backend, not a renderer port
+
+So "Two architectures" needs a third entry, and the third one wins:
+
+- *Option C — the glimmer backend* (what this project will now do): implement
+  =glimmer.backend='s nine functions over UIKit. glimmer owns reactivity, the
+  component model and reconciliation, and declares no natives; this project owns
+  widgets, prop/event wiring, and the app loop. Pros: the GTK4 wall does not
+  exist, the loop contract is already iOS-shaped, and the seam is nine functions
+  rather than four namespaces. Cons: the demo's Replicant-style state atom
+  becomes a reagent-style ratom — see below.
+
+** The better ancestor: jolt-lang/glimmer-uikit
+
+Following the lineage one step further turns up =jolt-lang/glimmer-uikit=: the
+AppKit backend for glimmer, pinned to the same v0.1.0 sha, 1,157 lines, with
+this in its =deps.edn=:
+
+#+begin_quote
+AppKit itself is NOT declared under =:jolt/native= — glimmer-uikit.ffi loads the
+frameworks itself, guarded to macOS only. That keeps =jolt -M:test= (the
+headless markup/string tests) runnable on Linux CI, where no AppKit exists.
+#+end_quote
+
+This is the ancestor of everything the audit examined. glitter-uikit's =app.clj=
+says it was "adapted from the non-reconciler half of glimmer-uikit.core (its
+scheduler, run*, run! and quit!)", and =GlitterTarget= is a rename of
+=GlimmerTarget=. The audit, in other words, spent its time on the /downstream/
+fork — the one carrying a reconciler that drags GTK — when the upstream one was
+the thing to fork: same Objective-C, same fixed-arity =objc_msgSend= bindings,
+same CoreFoundation scheduler, same Pango-subset-to-=NSAttributedString= markup
+pipeline, and no natives at all.
+
+Its own namespace docstring settles a naming question the audit left open:
+
+#+begin_quote
+The AppKit backend for glimmer (the macOS native toolkit — 'uikit' names this
+project, not the iOS framework).
+#+end_quote
+
+So the actual-UIKit backend cannot be called glimmer-uikit. Working name:
+*glimmer-ios*.
+
+** Two corrections to carry forward
+
+glitter-uikit is the later fork, and burinc fixed two things there that
+glimmer-uikit's =core.clj= still has. Both must come along.
+
+*The scheduler drain is not atomic.* glimmer-uikit's perform callback:
+
+#+begin_src clojure :tangle no
+(let [jobs @queue]
+  (reset! queue [])
+  ...)
+#+end_src
+
+A worker thread's =(swap! queue conj work)= landing between the deref and the
+reset is captured by neither the already-read =jobs= nor the just-clobbered
+queue: the thunk is lost permanently, with no error and no log line.
+glitter-uikit's CORRECTION (P3.T2, 2026-08-20) replaced it with =swap-vals!=,
+which is CAS-based — a concurrent post either drains now or survives for the
+next signal.
+
+*=loop-running?= is set after the mount.* glimmer-uikit's =run*= calls
+=(mount-root! win :window)= and only afterwards =(reset! b/loop-running? true)=,
+so for the whole of the mount the flag is false and every off-thread ratom write
+renders inline, on the wrong thread. Same bug as glitter-uikit's P4.T4
+correction, which a main-thread smoke found there.
+
+The second one fixes itself here: once =mount-root!= moves inside
+=didFinishLaunchingWithOptions:=, the flag is necessarily set before
+=UIApplicationMain= — which is glimmer-gtk's ordering. Both deserve a PR
+upstream regardless of what this project does.
+
+The synthesis, then: the seam and the loop ordering from *glimmer-gtk*,
+everything Objective-C from *glimmer-uikit*, the two corrections from
+*glitter-uikit*.
+
+** What it costs: the counter is no longer unchanged
+
+The introduction's promise — the counter running "with its state/view/actions
+code unchanged except the requires" — does not survive the substrate change.
+glimmer is reagent-shaped: form-2 components, component-local ratoms,
+=:on-click= taking a closure. The demo is Replicant-shaped: one state atom,
+=[[:action/inc]]= vectors, =s/multi-spec= validation, =demo.registry='s
+multimethod pair.
+
+The damage is smaller than that sounds. glimmer-uikit's widget layer already
+supports =:spacing=, =:homogeneous=, =:margin= (mapped to the stack's edge
+insets) and =:markup= over the same Pango vocabulary, so the counter's view
+survives character for character:
+
+#+begin_src clojure :tangle no
+[:label {:markup [:span {:size "xx-large" :weight "bold"} (str count)]}]
+#+end_src
+
+And =:on-click= takes an arbitrary closure, so actions-as-data survives with its
+specs and multimethods intact:
+
+#+begin_src clojure :tangle no
+[:button {:label "+ 1" :on-click #(reg/execute-actions nil [[:action/inc]])}]
+#+end_src
+
+What changes is one line per button, and the state atom becoming a ratom. So
+milestone 4's claim narrows, honestly, to: /the counter's view unchanged, its
+dispatch rewired one line per button/. That is a diff worth printing, and a
+better demonstration than an assertion of sameness.
+
+** What has not changed
+
+=jolt build= cross-targeting is still the open question, and nothing above
+touches it. Dmitri's message is about the backend seam, not about =tarm64ios=,
+=pb=, or W^X. The Android experiment's workaround — drive Chez directly with a
+reduced jolt library — remains the fallback, and proving it works is independent
+of the answer. It becomes milestone 0.
+
+(Hours later, it was answered — see
+[[*The real unknown was in =jolt --help= (2026-08-30, later)][the next section]].)
+
+** The real unknown was in =jolt --help= (2026-08-30, later)
+
+The question marked for Dmitri above — does =jolt build= cross-target? — had
+its answer installed on this machine the whole time:
+
+#+begin_example
+$ jolt --version
+jolt v0.7.29
+$ jolt --help | grep -A3 'build -m'
+  build -m NS [-o OUT] [--opt|--dev] [--direct-link] [--tree-shake] [--dynamic]
+              [--library] [--target MACHINE --target-pack DIR]
+                         ... --target cross-compiles either one for another
+                         Chez machine (see tools/cross-compile)
+#+end_example
+
+=tools/cross-compile/README.md= in the jolt repo is the answer to
+[[https://github.com/jolt-lang/jolt/issues/375][jolt#375]], and its first line is "yes — jolt cross-compiles." The mechanism
+is exactly the one the audit guessed at: steps 1–3 of =jolt build= emit
+machine-neutral Scheme text; step 4 (=compile-file= → =make-boot-file= → cc
+link) runs under Chez's own cross =xpatch=, which =make bootquick XM=<target>=
+produces alongside the target's boot files. A *target pack* is a directory
+holding the target's =petite.boot=, =scheme.boot=, =libkernel.a=, =scheme.h=,
+the =xpatch=, a =link-libs= file of =-l=​/​=-framework= flags, and static lz4/zlib
+under =lib/=; =make-pack.sh= assembles one from a prepared Chez checkout.
+=JOLT_TARGET_CC= and =JOLT_TARGET_ARCH_FLAG= pick the target compiler and its
+flags; =JOLT_TARGET_LINK_LIBS= overrides the pack's =link-libs= wholesale.
+
+Proven so far: macOS arm64 → x86_64, Linux x86_64 ↔ aarch64, and cross-OS
+macOS → Linux via =zig cc=. Not iOS — the README never mentions it — but
+nothing in the mechanism is macOS-specific, and =make-pack.sh= accepts any
+machine string. Three iOS-specific wrinkles, all visible from the scripts:
+
+- =make-pack.sh='s =link-libs= =case= matches =*osx=, =*le=, =*nt= and falls
+  through to =-llz4 -lz -lm= for anything else — so =tarm64ios= gets a link
+  line with no =Foundation= and no =iconv=. =JOLT_TARGET_LINK_LIBS= is the
+  override; the right string is roughly
+  =-llz4 -lz -framework Foundation -liconv -lm= (no ncurses — the kernel is
+  built =-DDISABLE_CURSES=).
+- lz4 is not in the iOS SDK (libz is). Chez's in-tree lz4 has to be built for
+  the target, which the cross configure does; the pack's =lib/liblz4.a= then
+  carries it.
+- Chez pins: jolt's CI builds against *Chez v10.4.1*, and a pack's xpatch,
+  boots and kernel must all come from that one tree. Mainline's BUILDING
+  recipe for =tarm64ios= is present at that tag.
+
+And the simulator recipe the milestone list already asked for, now concrete
+— the BUILDING recipe with the SDK and target swapped:
+
+#+begin_example
+git clone --depth 1 --branch v10.4.1 --recurse-submodules https://github.com/cisco/ChezScheme ~/dev/ChezScheme
+cd ~/dev/ChezScheme
+./configure -m=tarm64osx --installprefix=/opt/chez && make && sudo make install   # host compiler (~6 min)
+make bootquick XM=tarm64ios                            # boots + xpatch  (~2 min)
+SDK=$(xcrun -sdk iphonesimulator --show-sdk-path)
+./configure --cross --force -m=tarm64ios --disable-curses --disable-x11 \
+  CFLAGS="-target arm64-apple-ios-simulator -isysroot $SDK -DTARGET_OS_IPHONE=1 -DDISABLE_CURSES" \
+  LDFLAGS="-liconv" CC_FOR_BUILD=clang
+make                                                   # target kernel   (~1 min)
+CHEZ_SRC=~/dev/ChezScheme tools/cross-compile/make-pack.sh tarm64ios /tmp/pack-tarm64ios-sim
+
+JOLT_CHEZ=/opt/chez/bin/chez \
+JOLT_TARGET_CC=clang \
+JOLT_TARGET_ARCH_FLAG="-target arm64-apple-ios-simulator -isysroot $SDK" \
+JOLT_TARGET_LINK_LIBS="-L/tmp/pack-tarm64ios-sim/lib -llz4 -lz -framework Foundation -liconv -lm" \
+  jolt build -m hello.core -o Hello.app/Hello --target tarm64ios --target-pack /tmp/pack-tarm64ios-sim
+#+end_example
+
+One detail the scripts make explicit: a cross build always /spawns/ a host
+Chez to run the xpatch'd =compile-file= (the self-contained in-process
+compiler cannot load one). =build.ss= finds it through =$JOLT_CHEZ=, falling
+back to =chez=, =scheme= or =petite= on =PATH= — and the Homebrew jolt ships
+none of those, which is why the host build above is installed and named.
+
+Untested as written — that is milestone 1. But the shape is no longer a
+research question; it is a script waiting for an SDK.
+
+*** The actual blocker: no Xcode
+
+#+begin_example
+$ xcodebuild -version
+xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer
+directory '/Library/Developer/CommandLineTools' is a command line tools instance
+$ xcrun -sdk iphonesimulator --show-sdk-path
+xcrun: error: SDK "iphonesimulator" cannot be located
+$ xcrun simctl list devices available | grep iPhone
+(nothing)
+#+end_example
+
+Everything above this line was researched on a machine with Command Line
+Tools only. No iOS SDK, no simulator runtime, no =simctl= devices. Milestone
+1 cannot start — cannot even configure Chez's kernel — until Xcode proper is
+installed and =xcode-select= pointed at it. That is the next step, and it is
+a download, not a design decision.
+
+* Milestones
+
+Written for option B, and kept: the shape of the climb barely changes, and
+the two places it was wrong — packaging last, and "code unchanged" — are
+worth being able to see. Superseded by the revised list below.
+
+1. *Simulator hello-world*: Chez kernel built for the simulator SDK
+   (=arm64-apple-ios-simulator=), a C =main= + =Sscheme_init= + embedded boot,
+   jolt =-main= prints from inside a simulator =.app=.
+2. *ObjC FFI proof*: =objc_getClass("UILabel")= round-trips in the simulator.
+3. *Bootstrap port*: runtime-built app delegate + =UIApplicationMain= + the
+   verbatim CFRunLoopSource scheduler → an empty =UIWindow= appears.
+4. *Minimal widget set*: =:vbox= =:hbox= =:label= =:button= + the renderer →
+   *the counter, on the simulator, its code unchanged*. ← the demo
+5. *Device*: dev-signed build first (debugger JIT), then the =pb= backend for
+   distribution; measure whether the interpreter cost is noticeable.
+6. *Packaging*: Info.plist + provisioning + =codesign= — the macOS demo
+   already rehearsed tangling a =.app= bundle from the notebook; iOS adds
+   signing on top.
+
+** Revised, after the strategy change (2026-08-30)
+
+The list above assumed option B, and put packaging last. Both are wrong. A
+simulator =.app= needs an =Info.plist=, =UIDeviceFamily=, =MinimumOSVersion= and
+=xcrun simctl install= before milestone 1's =-main= can print anything, so only
+provisioning and =codesign= genuinely belong at the end — and given the -10669
+saga the macOS notebook records, this project of all projects should treat
+bundle shape as load-bearing from the first launch.
+
+0. *Fork =glimmer-uikit=*, drop the stale =src/glimmer_gtk/= tree it inherited
+   from its own fork, and get =jolt test= green — the headless suite proves the
+   core needs no toolkit. In parallel, and independent of everything else: put
+   =jolt build= cross-targeting to Dmitri, and reproduce the Android
+   experiment's build shape as the fallback if the answer is no.
+   (The answer is yes — =jolt build --target= — so the fallback is moot; what
+   milestone 0 now needs is Xcode.)
+1. *Simulator hello-world, packaged*: Chez for =arm64-apple-ios-simulator=. Note
+   that the BUILDING recipe quoted above is the /device/ one — the simulator
+   wants =-isysroot $(xcrun -sdk iphonesimulator --show-sdk-path)= and
+   =-target arm64-apple-ios-simulator=; there is no separate machine type, and
+   =TARGET_OS_SIMULATOR= is what distinguishes them. Plus a minimal
+   =Info.plist= tangled from this document, =simctl install=, =-main= prints.
+2. *FFI proof*: =objc_getClass("UILabel")= round-trips. The change is the
+   /guard/, not the dlopen path: =glimmer-uikit.ffi= gates the load on
+   =os.name= being "Mac OS X", and its failure mode is a =println= followed by
+   every class lookup silently returning null.
+3. *=:run= and =:schedule=*: =UIApplicationMain= with a delegate class built at
+   runtime, the CFRunLoopSource scheduler ported verbatim /with/ the
+   =swap-vals!= fix, and =mount-root!= called from
+   =didFinishLaunchingWithOptions:= → an empty =UIWindow= with a root view
+   controller. One shape change to expect: =UIApplicationMain= takes a delegate
+   /class name/ and instantiates the delegate itself, so the delegate cannot be
+   the shared target instance the way =setDelegate:= allows on macOS — the
+   =mount-root!= closure has to reach the callback through a global.
+4. *The other seven keys*, for =:vbox= =:hbox= =:label= =:button= → *the
+   counter, on the simulator*. Two silent no-ops to expect: the markup pipeline
+   builds =NSFont= and =NSColor= objects, neither of which exists on iOS (and
+   messaging nil returns nil, so the label renders unstyled instead of
+   crashing), and =UIStackView= ignores =layoutMargins= unless
+   =isLayoutMarginsRelativeArrangement= is YES, so =:margin= does nothing at
+   all.
+5. *Device*: dev-signed build first (debugger JIT), then =pb= for distribution.
+6. *Distribution*: provisioning and =codesign=, on top of the bundle milestone 1
+   already built.
+
+Open, and inherited: every backend in this lineage tests through
+=:auto-quit-ms=, which =quit!= implements with =stop-app!= — and an iOS app
+neither quits nor may call =exit()=. glimmer's headless mock backend already
+covers the reconciler, so what needs a substitute is the widget-level smokes;
+=simctl= screenshots are the obvious candidate.
+
+* References
+
+- [[https://github.com/cisco/ChezScheme/blob/main/BUILDING][Chez Scheme BUILDING]] — the =tarm64ios= cross-compile recipe and the =pb=
+  bootstrap story.
+- [[https://github.com/jolt-lang/jolt][jolt]] and [[https://jolt-lang.github.io/docs/building-and-deps.html][Building & Running]] — the =jolt build= AOT pipeline this project
+  needs to cross-target.
+- [[https://github.com/jasalt/jolt-android-experiment][jolt-android-experiment]] — the Android feasibility PoC (embedded-core
+  architecture, effects as data over JNI); its =docs/GOTCHAS.md= and
+  =REPORT.md= are required reading before repeating its mistakes here.
+- [[https://github.com/burinc/glitter-uikit][glitter-uikit]] — the AppKit renderer this project ports; its =ffi.clj=
+  docstring is the short course on =objc_msgSend= from a C FFI, and its
+  =GlitterTarget= class-building pattern is the app-delegate mechanism.
+- [[https://github.com/statonjr/glitter-uikit-demo][glitter-uikit-demo]] — the macOS literate notebook this one continues from;
+  the counter that must run unchanged lives in its =examples/counter/=.
+- [[https://docs.racket-lang.org/raco/cross.html][Racket on iOS]] — prior art for shipping Chez-based runtimes through the
+  App Store via =pb=.
+- [[https://developer.apple.com/documentation/uikit][UIKit documentation]] — notably =UIApplicationMain=, =UIStackView=,
+  =UIControl=, and =UIWindow=.
+- [[https://github.com/jolt-lang/glimmer][glimmer]] — the reactive core Dmitri factored out: ratom, component model and
+  reconciler, three namespaces and no dependencies at all. =glimmer.backend='s
+  namespace docstring is the whole contract this project implements.
+- [[https://github.com/jolt-lang/glimmer-gtk][glimmer-gtk]] — the GTK4 backend, and the reference implementation of the
+  seam; its =run*= is the loop shape iOS needs, calling =mount-root!= from
+  inside the =activate= callback.
+- [[https://github.com/jolt-lang/glimmer-uikit][glimmer-uikit]] — the AppKit backend, and the repo this project forks. Despite
+  the name it is macOS; its own docstring says so.
+- [[https://github.com/jolt-lang/jolt/tree/main/tools/cross-compile][jolt tools/cross-compile]] — the answer to jolt#375: =jolt build --target=,
+  target packs, =make-pack.sh=, and the proofs on macOS, Linux and cross-OS.
+  The iOS recipe above is this README with the SDK swapped.
