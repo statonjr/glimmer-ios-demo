@@ -448,7 +448,7 @@ reports, which is all a prompt needs.
                 (catch java.net.ConnectException _
                   (binding [*out* *err*]
                     (println (str "nothing listening on " host ":" port " — is the app in the foreground? "
-                                  "(iOS suspends backgrounded apps; `jolt wake` relaunches it)")))
+                                  "(iOS suspends backgrounded apps; `jolt wake` brings it forward)")))
                   (System/exit 1)))
       out  (.getOutputStream sock)
       in   (java.io.PushbackInputStream. (.getInputStream sock))

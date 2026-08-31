@@ -122,6 +122,39 @@ ever signals a source that already exists.
     (ffi/foreign-callable did-finish-launching
                           [:pointer :pointer :pointer :pointer] :uint8 :collect-safe)))
 
+;; --- lifecycle ---------------------------------------------------------------
+;; UIKit tells the delegate when the app leaves and returns to the foreground.
+;; Each message is logged with a timestamp and handed to any registered handler
+;; — persistence hooks :background, an nREPL might re-listen on :foreground.
+(defonce ^:private lifecycle-handlers (atom {}))   ; event -> (fn [])
+
+(defn on-lifecycle!
+  "Register `f` (zero-arg) for `event`: :resign-active :background :foreground
+  :active :terminate. One handler per event; nil removes."
+  [event f]
+  (swap! lifecycle-handlers (if f #(assoc % event f) #(dissoc % event)))
+  nil)
+
+(defn- lifecycle! [event]
+  (println (str "glimmer-ios: " (name event) " @ " (System/currentTimeMillis)))
+  (when-let [f (get @lifecycle-handlers event)]
+    (try (f) (catch :default e (println "glimmer-ios: lifecycle handler failed:" e))))
+  0)
+
+(def ^:private lifecycle-selectors
+  {:resign-active "applicationWillResignActive:"
+   :background    "applicationDidEnterBackground:"
+   :foreground    "applicationWillEnterForeground:"
+   :active        "applicationDidBecomeActive:"
+   :terminate     "applicationWillTerminate:"})
+
+(defonce ^:private lifecycle-cbs
+  (delay
+    (into {}
+          (for [[event _] lifecycle-selectors]
+            [event (ffi/foreign-callable (fn [_self _cmd _app] (lifecycle! event))
+                                         [:pointer :pointer :pointer] :void :collect-safe)]))))
+
 (defn- register-delegate-class!
   "UIApplicationMain instantiates the delegate by class name, so the class must
   exist before the call. Idempotent."
@@ -131,6 +164,8 @@ ever signals a source that already exists.
       (let [c (u/objc-allocate-class-pair (u/cls "NSObject") "GlimmerAppDelegate" 0)]
         (u/class-add-method c (u/sel "application:didFinishLaunchingWithOptions:")
                             @did-finish-cb "c@:@@")
+        (doseq [[event selector] lifecycle-selectors]
+          (u/class-add-method c (u/sel selector) (get @lifecycle-cbs event) "v@:@"))
         (u/objc-register-class-pair c))))
   nil)
 
@@ -170,3 +205,13 @@ ever signals a source that already exists.
 
 (defonce ^:private _installed (do (install!) true))
 #+end_src
+
+* Lifecycle
+
+The delegate gets five more methods, one per UIKit lifecycle message, each
+a =:collect-safe= callable that logs the event with a timestamp and calls a
+handler registered with =on-lifecycle!=. The backend takes no action of its
+own on any of them — what the app should do on =:background= (persist) or
+=:foreground= (re-listen) is the app's business; this is the seam for it.
+What UIKit actually sends, and when, is recorded in README.org's Lifecycle
+section.

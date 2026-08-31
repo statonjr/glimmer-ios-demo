@@ -504,6 +504,7 @@ src/
 test/
 scripts/
 signing/
+patches/
 #+end_src
 
 And the tangle itself is a =jolt= task, borrowed from the macOS demo, so the
@@ -550,9 +551,9 @@ once, from any Emacs.
          ;; a terminal REPL into a running app: nREPL's own client (jolt ships only the
          ;; server). Defaults to USB via `jolt proxy`; HOST=<phone ip> PORT=7888 for Wi-Fi.
          connect "rlwrap -H .nrepl-history bb scripts/nrepl-repl"   ; 0.1 s to a prompt; HOST/PORT as above
-         ;; iOS suspends a backgrounded app and its listener refuses; this brings it back
-         ;; to the foreground (works over Wi-Fi — no cable) so `jolt connect` answers again
-         wake    "xcrun devicectl device process launch --terminate-existing --device ${DEVICE:?set DEVICE to the phone UDID} dev.statonsoftware.glimmer-ios.hello"
+         ;; iOS suspends a backgrounded app; a plain launch RESUMES it (state kept, foreground
+         ;; and active fire) so `jolt connect` answers again. Not --terminate-existing: that kills it.
+         wake    "xcrun devicectl device process launch --device ${DEVICE:?set DEVICE to the phone UDID} dev.statonsoftware.glimmer-ios.hello"
          ;; what TARGET=sim and TARGET=device would talk to: booted simulators, paired phones
          devices "echo '# simulators (booted)'; xcrun simctl list devices booted | grep -E 'Booted'; echo '# devices (paired; export DEVICE=<udid>)'; xcrun devicectl list devices 2>/dev/null | tail -n +3"
          ;; nREPL's own JVM client, for comparison or when a fuller client is wanted (1.4 s+)
@@ -673,6 +674,7 @@ files come second, from Homebrew's =chez=:
 #+begin_example
 cd ~/dev/ChezScheme
 SDK=$(xcrun -sdk iphonesimulator --show-sdk-path)
+git apply ~/code/personal/glimmer-ios-demo/patches/chez-simulator-jit.patch   # tangled from this notebook; see "The simulator kernel's collector"
 ./configure --cross --force -m=tarm64ios --disable-curses --disable-x11 \
   CFLAGS="-target arm64-apple-ios-simulator -isysroot $SDK -DTARGET_OS_IPHONE=1 -DDISABLE_CURSES" \
   LDFLAGS="-liconv" CC_FOR_BUILD=clang
@@ -1514,6 +1516,141 @@ magick "$T/1024.png" -resize 120x120 Hello.app/AppIcon60x60@2x.png
 rm -rf "$T"
 #+end_src
 
+* Lifecycle (2026-08-31, late)
+
+TODO 2. The delegate now carries the five UIKit lifecycle messages
+([[file:glimmer-ios/core.org][core.org]], "Lifecycle"): each logs and calls a handler registered with
+=on-lifecycle!=. Backgrounding from the command line is launching another
+app — Safari — with =simctl= or =devicectl=; foregrounding is launching ours
+again. The same sequence on the simulator and on the phone:
+
+#+begin_example
+glimmer-ios: active         @ …52855      launch
+glimmer-ios: resign-active  @ …52896      Safari launched
+glimmer-ios: background     @ …53678      +0.8 s
+glimmer-ios: foreground     @ …63268      our app launched again, ~10 s later
+glimmer-ios: active         @ …63707      +0.4 s
+#+end_example
+
+Three findings:
+
+- *A backgrounded app's socket accepts and says nothing.* =nc -z= reports
+  the handshake succeeded — the kernel's listen backlog takes the connection
+  on the suspended process's behalf — and then no byte comes back; a raw
+  bencode =eval= times out. On both platforms. So "is it listening" is not
+  the question; "is it in front" is, which the client's hint now says.
+- *A plain launch resumes; =--terminate-existing= kills.* The first =jolt wake=
+  used the flag and the log said =App terminated due to signal 9= — a fresh
+  process, count back to 0, and no =foreground= line because there was no
+  foreground, only a launch. Without the flag =devicectl= brings the
+  suspended instance forward: =foreground=, =active=, the ratom intact, the
+  listener answering. =jolt wake= is the plain launch now.
+- *=applicationWillTerminate:= never fired.* =simctl terminate= and
+  =devicectl='s kill are SIGKILL; iOS itself evicts suspended apps the same
+  way. Anything that must survive has to be written at =:background=, which
+  is where persistence (TODO 3) will hook.
+
+The parked Chez thread, for its part, did nothing remarkable: suspended with
+the process, resumed with it. =:collect-safe= callables arriving on the main
+thread while jolt is parked in =UIApplicationMain= — which is every one of
+these — behaved exactly as the delegate's first callback always has.
+
+* The simulator kernel's collector (2026-08-31, later still)
+
+Lifecycle's allocation stress — twenty 200,000-element vectors, from an
+nREPL thread — killed the simulator app in the collector, twice:
+
+#+begin_example
+nonrecoverable invalid memory reference
+EXC_BAD_ACCESS · KERN_PROTECTION_FAILURE · thread 8 · S_gc_ocd ← S_gc ← S_do_gc
+#+end_example
+
+The host survived the same loop from a worker thread (1.7 s); the phone,
+on =pb=, survived it (26.7 s). Only the native simulator build died — and
+=KERN_PROTECTION_FAILURE= inside a GC is a write to a page that is not
+writable, which is W^X.
+
+Chez's =c/version.h= keys on =TARGET_OS_IPHONE=, which the SDK defines =1=
+"for both iPhone and iPhoneSimulator", and on it defines
+=WRITE_XOR_EXECUTE_CODE=: code segments are flipped between W and X with
+=mprotect=, /process-wide/ — =segment.c='s own comment calls this
+"best-effort" and incompatible with another thread touching code while the
+collector runs. macOS arm64 takes a different path: =MAP_JIT= pages and
+=pthread_jit_write_protect_np=, a /per-thread/ toggle. A GC on the nREPL
+thread flipping pages under a main thread that is inside UIKit is the race,
+and the simulator, a macOS process, had inherited the device's mechanism.
+
+Three probes with =simctl spawn=, before touching the kernel:
+
+| =mmap= RWX, no =MAP_JIT= | /Permission denied/ — so the flips were the only reason anything ran |
+| =mmap= RWX with =MAP_JIT= | ok |
+| =pthread_jit_write_protect_np= | =dlsym= finds it; the toggle works from a worker thread. Only the SDK /header/ hides it: =unavailable: not available on iOS= |
+
+So the patch: the simulator keeps =S_TARGET_OS_IPHONE= (cache flushing, the
+=SYSTEM= stub) and loses =WRITE_XOR_EXECUTE_CODE=; the toggle is reached
+through an =__asm__= alias the header cannot veto. Applied to the checkout
+before the simulator configure in the milestone-1 recipe
+(=git -C ~/dev/ChezScheme apply patches/chez-simulator-jit.patch=); the
+device's =tpb64l= kernel is untouched, and needs nothing — =pb= has no code
+pages to protect.
+
+#+begin_src diff :tangle patches/chez-simulator-jit.patch :mkdirp true
+diff --git a/c/version.h b/c/version.h
+index 08a3b58..36017eb 100644
+--- a/c/version.h
++++ b/c/version.h
+@@ -343,13 +343,25 @@ typedef int tputsputcchar;
+ /* for both iPhone and iPhoneSimulator */
+ #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+ # define SYSTEM(s) ((void)s, -1)
+-# define WRITE_XOR_EXECUTE_CODE
+ # define S_TARGET_OS_IPHONE
++/* The device has no MAP_JIT without an entitlement, so code pages are flipped
++   between W and X with mprotect — process-wide, and racy across threads (see
++   segment.c). The simulator is a macOS process: MAP_JIT and the per-thread
++   pthread_jit_write_protect_np toggle work there, so it takes the macOS path. */
++# if !(defined(TARGET_OS_SIMULATOR) && TARGET_OS_SIMULATOR)
++#  define WRITE_XOR_EXECUTE_CODE
++# endif
+ #endif
+ #if defined(__arm64__)
+ # if !defined(WRITE_XOR_EXECUTE_CODE)
+ #  define S_MAP_CODE MAP_JIT
+-#  define S_ENABLE_CODE_WRITE(on) pthread_jit_write_protect_np(!(on))
++#  if defined(TARGET_OS_SIMULATOR) && TARGET_OS_SIMULATOR
++/* the iOS SDK header marks it unavailable; the simulator's libsystem exports it */
++extern void S_pthread_jit_write_protect_np(int) __asm__("_pthread_jit_write_protect_np");
++#   define S_ENABLE_CODE_WRITE(on) S_pthread_jit_write_protect_np(!(on))
++#  else
++#   define S_ENABLE_CODE_WRITE(on) pthread_jit_write_protect_np(!(on))
++#  endif
+ # endif
+ # define CANNOT_READ_DIRECTLY_INTO_CODE
+ # include <pthread.h>
+#+end_src
+
+After it, three stress runs in a row, no abort. The numbers the milestone-5
+list asked for, twenty 200k vectors and a 5M-iteration arithmetic loop:
+
+| where | allocation | loop |
+|-------+------------+------|
+| Mac, native, main thread | 0.48 s | 6 ms |
+| Mac, native, nREPL worker thread | 1.7 s | — |
+| simulator, native (=tarm64ios=, patched), worker thread | 2.3 s | — |
+| iPhone 16 Pro, =pb= (=tpb64l=), worker thread | 26.7 s | 278 ms |
+
+The interpreter costs about 45× on the loop and 10–15× on allocation
+against native on comparable silicon — well past the "2–5×" the research
+section borrowed from Racket, which was measured on ordinary programs, not
+microbenchmarks. Nothing in the counter notices. And a mystery kept: the
+phone's app died once after a stress-then-background, and did not on the
+repeat; iOS evicts backgrounded apps over their memory budget without a
+callback, and the place to check is Settings → Privacy → Analytics Data for
+a =JetsamEvent= log, or =idevicecrashreport= over a cable.
+
+Upstream, for cisco/ChezScheme: =TARGET_OS_SIMULATOR= should take the
+=MAP_JIT= path; the patch above is the whole change.
+
 * Upstream
 
 Findings that belong to other repositories, written to be pasted into
@@ -1549,9 +1686,8 @@ done:
    counter runs on an iPhone 16 Pro with no JIT and no debugger. 6 is
    deferred on purpose: what is left of it is a distribution profile and an
    App Store Connect upload.
-2. *Lifecycle* — background/foreground the counter (=simctl= can do both),
-   relaunch, an allocation stress like EXP-005. What does a parked Chez
-   thread do on =applicationDidEnterBackground:=?
+2. +*Lifecycle*+ Done — see the Lifecycle section. A plain launch resumes;
+   =applicationWillTerminate:= is a fiction; persist at =:background=.
 3. *Persistence* — a =:storage/write= effect to the Documents dir, restored on
    a fresh launch (EXP-012's shape); the first effect-as-data on this side.
 4. +*nREPL in the simulator*+ Done, and on the phone too — see
