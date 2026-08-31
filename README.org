@@ -482,7 +482,6 @@ Generated files do not get that kind of edit:
 
 #+begin_src conf :tangle .gitignore :comments link
 .DS_Store
-.clj-kondo/.cache
 .jolt
 .lsp
 .vscode
@@ -491,11 +490,18 @@ Hello.app
 # clj -Sdeps cache from `jolt connect-clj`, and rlwrap's history for `jolt connect`
 .cpcache
 .nrepl-history
+.nrepl-port
 # raw screen recordings; `jolt media` derives the committed mp4/gif from them
 media/*.mov
-# the signing stub's generated project and build products (signing/project.yml is the source)
-signing/*.xcodeproj
-signing/build
+# everything `jolt tangle` writes, this file included — git tracks the notebooks and media/
+.gitignore
+Brewfile
+deps.edn
+.clj-kondo/
+src/
+test/
+scripts/
+signing/
 #+end_src
 
 And the tangle itself is a =jolt= task, borrowed from the macOS demo, so the
