@@ -1,4 +1,4 @@
-#+title: glitter-ios-demo
+#+title: glimmer-ios-demo
 #+author: Larry Staton
 #+date: 30 August 2026
 
