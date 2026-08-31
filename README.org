@@ -470,6 +470,9 @@ brew "chezscheme"            # host Chez 10.4.1, threaded, on PATH as `chez` —
 tap  "d12frosted/emacs-plus"
 cask "emacs-plus-app"        # tangles this document (the macOS demo says brew "emacs"; this machine runs Emacs+)
 mas  "Xcode", id: 497799835  # the iOS SDK, simulator runtimes and simctl; then xcode-select -s
+brew "xcodegen"             # a throwaway Xcode project, so Xcode mints the signing cert + profile (milestone 5)
+brew "libimobiledevice"     # iproxy: a TCP port on the phone, over USB, for nREPL (TODO 4)
+brew "rlwrap"               # arrows + history for `jolt connect` (clj needs it too)
 #+end_src
 
 The =.gitignore= tangles from here too — it is toolchain residue, and the
@@ -485,8 +488,14 @@ Generated files do not get that kind of edit:
 .vscode
 Brewfile.lock.json
 Hello.app
+# clj -Sdeps cache from `jolt connect-clj`, and rlwrap's history for `jolt connect`
+.cpcache
+.nrepl-history
 # raw screen recordings; `jolt media` derives the committed mp4/gif from them
 media/*.mov
+# the signing stub's generated project and build products (signing/project.yml is the source)
+signing/*.xcodeproj
+signing/build
 #+end_src
 
 And the tangle itself is a =jolt= task, borrowed from the macOS demo, so the
@@ -522,8 +531,22 @@ once, from any Emacs.
          ;; Milestone 1: cross-compile hello.core (or NS=screen.core) into the simulator bundle
          ;; (Info.plist is tangled), install it on the booted device, run it
          ;; with stdout attached. The pack is ~/dev/pack-tarm64ios-sim.
-         bundle  "PACK=$HOME/dev/pack-tarm64ios-sim; SDK=$(xcrun -sdk iphonesimulator --show-sdk-path); mkdir -p Hello.app && JOLT_TARGET_CC=clang JOLT_TARGET_ARCH_FLAG=\"-target arm64-apple-ios-simulator -isysroot $SDK\" JOLT_TARGET_LINK_LIBS=\"-L$PACK/lib -llz4 -lz -framework Foundation -liconv -lm\" jolt build -m ${NS:-hello.core} -o Hello.app/Hello --target tarm64ios --target-pack $PACK && rm -rf Hello.app/Hello.build"
+         bundle  "sh scripts/bundle"     ; NS=<ns> TARGET=sim|device — see Milestone 5
          install "xcrun simctl install booted Hello.app"
+         ;; the phone: sign with the minted identity + profile, install, launch with the console attached
+         device  "sh scripts/device"
+         ;; the live counter (demo.repl, nREPL on its loopback 7888) for TARGET=sim|device;
+         ;; then `jolt proxy` in another terminal for the phone, and connect to localhost:7889
+         live    "sh scripts/live"
+         proxy   "iproxy -u ${DEVICE:?set DEVICE to the phone UDID} 7889:7888"
+         ;; a terminal REPL into a running app: nREPL's own client (jolt ships only the
+         ;; server). Defaults to USB via `jolt proxy`; HOST=<phone ip> PORT=7888 for Wi-Fi.
+         connect "rlwrap -H .nrepl-history bb scripts/nrepl-repl"   ; 0.1 s to a prompt; HOST/PORT as above
+         ;; iOS suspends a backgrounded app and its listener refuses; this brings it back
+         ;; to the foreground (works over Wi-Fi — no cable) so `jolt connect` answers again
+         wake    "xcrun devicectl device process launch --terminate-existing --device ${DEVICE:?set DEVICE to the phone UDID} dev.statonsoftware.glimmer-ios.hello"
+         ;; nREPL's own JVM client, for comparison or when a fuller client is wanted (1.4 s+)
+         connect-clj "clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version \"1.3.1\"}}}' -M -m nrepl.cmdline --connect --host ${HOST:-127.0.0.1} --port ${PORT:-7889}"
          ;; not `run`: that is a jolt subcommand, and it wins over a task of the same name.
          ;; Plain launch: --console terminates the app when its session ends (milestone 3).
          launch  "xcrun simctl launch booted dev.statonsoftware.glimmer-ios.hello"
@@ -780,7 +803,6 @@ plist is tangled, the binary is built, nothing in it is source.
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleVersion</key>           <string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
-  <key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array>
   <key>MinimumOSVersion</key>          <string>14.0</string>
   <key>UIDeviceFamily</key>            <array><integer>1</integer></array>
   <key>LSRequiresIPhoneOS</key>        <true/>
@@ -1147,6 +1169,341 @@ and handled, or moot:
 - *=if-not= without an else.* glimmer-uikit's Pango validator, verbatim,
   drew kondo's "Missing else branch"; it is =when-not= here, and 0/0 is
   restored.
+
+* Milestone 5: the device, on portable bytecode (2026-08-31)
+
+The #jolt question — "aren't they a bitch about any kind of JITs?" — has
+the answer the research section gave it: Chez's =pb= backend interprets
+bytecode that ships as /data/; nothing is generated at runtime, and App
+Store rule 2.5.2 permits interpreting code bundled with the app. So the
+device milestone goes =pb= first — no debugger, ordinary dev signing, and
+the artifact is the one that would ship — with the native-under-debugger
+build demoted to a later speed measurement.
+
+** Chez on =tpb64l= for the phone: twenty seconds
+
+The threaded, 64-bit, little-endian portable machine type is =tpb64l=.
+The recipe is milestone 1's with the machine type and SDK swapped; a
+workarea is named after its machine type, so the simulator's =tarm64ios=
+tree stays beside it untouched:
+
+#+begin_example
+cd ~/dev/ChezScheme
+SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+./configure --cross --force -m=tpb64l --disable-curses --disable-x11 \
+  CFLAGS="-target arm64-apple-ios14.0 -isysroot $SDK -DTARGET_OS_IPHONE=1" \
+  LDFLAGS="-liconv" CC_FOR_BUILD=clang
+# → "Configuring for tpb64l to run on tarm64osx despite missing boot files"
+bin/zuo tpb64l bootquick --xpatch --host-scheme /opt/homebrew/bin/chez tpb64l   # 10 s
+make                                                                          # 9 s
+cd ~/dev/jolt && CHEZ_SRC=~/dev/ChezScheme tools/cross-compile/make-pack.sh tpb64l ~/dev/pack-tpb64l-ios
+#+end_example
+
+=libkernel.a='s objects are =LC_BUILD_VERSION platform 2= (iOS, the device),
+=minos 14.0=. The one warning is =ld= ignoring a duplicate =-liconv= — the
+pack's fall-through =link-libs= and =LDFLAGS= both name it.
+
+** jolt on =pb=: thirteen seconds
+
+The research section's other open question — jolt had never been run on the
+=pb= backend — turns out to have nothing to it: =build.ss= does not know what
+a machine type is, the pack's xpatch does.
+
+#+begin_example
+$ JOLT_TARGET_CC=clang JOLT_TARGET_ARCH_FLAG="-target arm64-apple-ios14.0 -isysroot $SDK" \
+  JOLT_TARGET_LINK_LIBS="-L$PACK/lib -llz4 -lz -framework Foundation -liconv -lm" \
+  jolt build -m hello.core -o hello --target tpb64l --target-pack ~/dev/pack-tpb64l-ios
+loading tpb64l cross compiler
+jolt build: wrote hello
+$ file hello
+hello: Mach-O 64-bit executable arm64      (platform 2, minos 14.0, 24.6 MB)
+#+end_example
+
+Untested until it runs on the phone, which needs a signature. Two changes
+so one bundle shape serves both targets: =CFBundleSupportedPlatforms= leaves
+the plist (it was the simulator's; the key is optional), and =jolt bundle=
+becomes a script that knows both packs:
+
+#+begin_src sh :tangle scripts/bundle :mkdirp true :comments link
+# jolt bundle: cross-compile NS into Hello.app for TARGET (sim | device).
+#   NS=demo.examples.counter TARGET=device jolt bundle
+set -eu
+NS="${NS:-hello.core}"
+TARGET="${TARGET:-sim}"
+EXTRA=""
+case "$TARGET" in
+  sim)    MACHINE=tarm64ios; PACK="$HOME/dev/pack-tarm64ios-sim"
+          ARCH="-target arm64-apple-ios-simulator -isysroot $(xcrun -sdk iphonesimulator --show-sdk-path)" ;;
+  device) MACHINE=tpb64l;    PACK="$HOME/dev/pack-tpb64l-ios"; EXTRA="-lffi"   # pb routes foreign calls through libffi
+          ARCH="-target arm64-apple-ios14.0 -isysroot $(xcrun -sdk iphoneos --show-sdk-path)" ;;
+  *) echo "TARGET must be sim or device" >&2; exit 2 ;;
+esac
+mkdir -p Hello.app
+JOLT_TARGET_CC=clang \
+JOLT_TARGET_ARCH_FLAG="$ARCH" \
+JOLT_TARGET_LINK_LIBS="-L$PACK/lib -llz4 -lz $EXTRA -framework Foundation -liconv -lm" \
+  jolt build -m "$NS" -o Hello.app/Hello --target "$MACHINE" --target-pack "$PACK"
+rm -rf Hello.app/Hello.build
+#+end_src
+** Minting a signature without an Xcode project
+
+A device install needs an /Apple Development/ certificate and a
+provisioning profile naming the app id, the team and the device. Xcode
+creates both automatically — but only while building an Xcode project
+with automatic signing, and this project has none. So it borrows one: a
+throwaway app target described for =xcodegen= in ten lines, built once with
+=-allowProvisioningUpdates=. The cert lands in the keychain and the profile
+under =~/Library/Developer/Xcode/UserData/Provisioning Profiles=; the
+stub's own binary is discarded, and =Hello.app= is signed with what it minted.
+The team id comes from =TEAM= and the phone's UDID from =DEVICE=, exported
+once in the shell: neither is a secret — both ride inside every signed app —
+but neither belongs to the notebook, which should build for anyone.
+The generated =.xcodeproj= and build products are ignored; the spec is the
+source.
+
+#+begin_src yaml :tangle signing/project.yml :mkdirp true
+name: SigningStub
+options:
+  bundleIdPrefix: dev.statonsoftware.glimmer-ios
+  deploymentTarget:
+    iOS: "14.0"
+settings:
+  DEVELOPMENT_TEAM: ${TEAM}        # export TEAM=<your Apple team id>; xcodegen expands it
+  CODE_SIGN_STYLE: Automatic
+targets:
+  Hello:
+    type: application
+    platform: iOS
+    sources: [Stub]
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: dev.statonsoftware.glimmer-ios.hello
+      GENERATE_INFOPLIST_FILE: YES     # signing needs a plist; the stub has none of its own
+#+end_src
+
+#+begin_src swift :tangle signing/Stub/main.swift :mkdirp true
+// The signing stub has no behaviour; it exists so Xcode mints a certificate
+// and a provisioning profile for dev.statonsoftware.glimmer-ios.hello.
+import UIKit
+UIApplicationMain(CommandLine.argc, CommandLine.unsafeArgv, nil, nil)
+#+end_src
+
+#+begin_example
+cd signing && xcodegen generate && xcodebuild -allowProvisioningUpdates \
+  -project SigningStub.xcodeproj -scheme Hello -destination generic/platform=iOS \
+  -derivedDataPath build build
+#+end_example
+
+The first run of that said something the =defaults= domain had not:
+
+#+begin_example
+error: No Accounts: Add a new account in Accounts settings.
+error: No profiles for 'dev.statonsoftware.glimmer-ios.hello' were found
+#+end_example
+
+The Distribution certificate in the keychain came from another machine;
+this Xcode has never been signed in. Xcode → Settings → Accounts → + →
+the Apple ID, then the command above again. That is the only step in this
+milestone that needs a mouse.
+
+Signed in, the second run got one step further and stopped on a newer
+wall: =PLA Update available: You currently don't have access to this
+membership resource. To resolve this issue, agree to the latest Program
+License Agreement in your developer account.= Apple revises the agreement
+a few times a year, and until the account holder clicks through it on
+developer.apple.com, every provisioning request is refused — a second
+step that needs a mouse, and not one =xcodebuild= can take for you.
+
+** Signing, installing, launching
+
+With the cert and profile minted, =jolt device= does the rest: find the
+profile for the app id, embed it, lift its entitlements (=application-identifier=,
+=team-identifier=, =get-task-allow=), sign with the Apple Development identity,
+install through =devicectl=, and launch with the console attached — which on
+a phone is the only way to see stdout.
+
+Three attempts before it installed, each a lesson about the script rather
+than the phone. The profile Xcode mints is a team /wildcard/
+(=<TEAM>.*=), so the matcher had to accept one — and the app must still
+be signed with a /concrete/ =application-identifier= the wildcard covers, or
+=installd= answers "A valid provisioning profile for this executable was not
+found". Then the entitlements were the wrong profile's altogether: the
+search loop decoded every profile into the same temp file, so what was left
+there afterwards was the /last/ one it looked at, not the match — permR's
+App Store profile, =get-task-allow= false and all. And =plutil= splits key
+paths on dots, so =com.apple.developer.team-identifier= is four levels of
+nesting until the dots are escaped.
+
+#+begin_src sh :tangle scripts/device :mkdirp true :comments link
+# jolt device: sign Hello.app with the minted Development identity and the
+# team profile for its bundle id, install on the paired iPhone, launch with
+# the console attached. Build first: NS=<ns> TARGET=device jolt bundle
+set -eu
+APP=Hello.app
+BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")
+DEVICE="${DEVICE:?set DEVICE to the phone UDID, from: xcrun devicectl list devices}"
+PROFILES="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+IDENTITY=$(security find-identity -v -p codesigning | grep -oE '"Apple Development: [^"]+"' | head -1 | tr -d '"')
+[ -n "$IDENTITY" ] || { echo "no Apple Development identity — build signing/ once with -allowProvisioningUpdates" >&2; exit 2; }
+# the newest development profile whose app id matches ours — or a team
+# wildcard (<TEAM>.*), which is what Xcode mints by default. A glob, not
+# $(ls …): the directory name has a space in it, and word-splitting would
+# cut every path in two.
+PROFILE=""
+for p in "$PROFILES"/*.mobileprovision; do
+  security cms -D -i "$p" > /tmp/prof.plist 2>/dev/null || continue
+  appid=$(plutil -extract Entitlements.application-identifier raw /tmp/prof.plist 2>/dev/null || true)
+  gta=$(plutil -extract Entitlements.get-task-allow raw /tmp/prof.plist 2>/dev/null || true)
+  case "$appid" in
+    *".$BUNDLE_ID"|*".*") if [ "$gta" = true ] && { [ -z "$PROFILE" ] || [ "$p" -nt "$PROFILE" ]; }; then PROFILE="$p"; fi ;;
+  esac
+done
+[ -n "$PROFILE" ] || { echo "no development profile for $BUNDLE_ID" >&2; exit 2; }
+cp "$PROFILE" "$APP/embedded.mobileprovision"
+# decode the MATCHED profile again: the loop above left the last one it looked
+# at in /tmp/prof.plist, whichever that was (it was permR's App Store profile)
+security cms -D -i "$PROFILE" > /tmp/prof.plist
+plutil -extract Entitlements xml1 -o /tmp/entitlements.plist /tmp/prof.plist
+# The profile is a team wildcard, but the app must be signed with a CONCRETE
+# application-identifier that the wildcard covers — installd rejects a literal
+# "TEAM.*" with "A valid provisioning profile for this executable was not found".
+TEAM=$(plutil -extract 'com\.apple\.developer\.team-identifier' raw /tmp/entitlements.plist)   # dots are path separators unless escaped
+plutil -replace application-identifier -string "$TEAM.$BUNDLE_ID" /tmp/entitlements.plist
+codesign --force --sign "$IDENTITY" --entitlements /tmp/entitlements.plist "$APP"
+codesign --verify --verbose=2 "$APP"
+xcrun devicectl device install app --device "$DEVICE" "$APP"
+xcrun devicectl device process launch --console --terminate-existing --device "$DEVICE" "$BUNDLE_ID"
+#+end_src
+
+** On the phone: one line, and the right one
+
+#+begin_example
+$ NS=hello.core TARGET=device jolt bundle && jolt device
+Hello.app: valid on disk
+Hello.app: satisfies its Designated Requirement
+App installed:
+• bundleID: dev.statonsoftware.glimmer-ios.hello
+• installationURL: file:///private/var/containers/Bundle/Application/…/Hello.app/
+Launched application with dev.statonsoftware.glimmer-ios.hello bundle identifier.
+Waiting for the application to terminate…
+Error in foreign-procedure: protocol not supported (libffi unavailable)
+()
+App terminated due to signal 6.
+#+end_example
+
+A jolt process, cross-compiled to portable bytecode, signed, installed and
+launched on an iPhone 16 Pro running iOS 26.6.1 — and it got exactly as far
+as the first =foreign-procedure=. That is the =pb= backend's one known cost,
+and the research section did not know it: a native Chez emits its own
+call stubs for foreign procedures; portable bytecode has no code generator
+to emit them with, so on =pb= Chez routes foreign calls through /libffi/,
+and only when it was built with =--enable-libffi=. This kernel was not. And
+jolt's runtime calls C before =-main= ever runs.
+
+So the recipe grows one layer: libffi, cross-built for arm64 iOS, static,
+linked into the kernel and into the pack. Racket CS ships on iOS this way.
+
+** libffi, and the line
+
+libffi 3.8.0 builds for the device from its release tarball with the host
+set to Darwin and the SDK in =CFLAGS=; Chez's =--enable-libffi= is a
+kernel-only switch (=ENABLE_LIBFFI= in =c/ffi.c=), so the boot files and
+xpatch from before are untouched — only the kernel and the pack change, and
+=scripts/bundle= adds =-lffi= to the device link line:
+
+#+begin_example
+cd ~/dev && curl -sfL https://github.com/libffi/libffi/releases/download/v3.8.0/libffi-3.8.0.tar.gz | tar xz && mv libffi-3.8.0 libffi
+cd libffi && SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+./configure --host=aarch64-apple-darwin --build=$(./config.guess) --disable-shared --enable-static --disable-docs \
+  --prefix=$HOME/dev/libffi-ios CC=clang \
+  CFLAGS="-target arm64-apple-ios14.0 -isysroot $SDK -O2" LDFLAGS="-target arm64-apple-ios14.0 -isysroot $SDK"
+make -j8 install                                             # libffi.a: platform 2, arm64
+
+cd ~/dev/ChezScheme
+./configure --cross --force -m=tpb64l --enable-libffi --disable-curses --disable-x11 \
+  CFLAGS="-target arm64-apple-ios14.0 -isysroot $SDK -DTARGET_OS_IPHONE=1 -I$HOME/dev/libffi-ios/include" \
+  LDFLAGS="-L$HOME/dev/libffi-ios/lib -liconv" CC_FOR_BUILD=clang
+make                                                         # libkernel.a now has ffi_call
+cd ~/dev/jolt && CHEZ_SRC=~/dev/ChezScheme tools/cross-compile/make-pack.sh tpb64l ~/dev/pack-tpb64l-ios
+cp ~/dev/libffi-ios/lib/libffi.a ~/dev/pack-tpb64l-ios/lib/  # make-pack.sh does not know about it
+#+end_example
+
+#+begin_example
+$ NS=hello.core TARGET=device jolt bundle && jolt device
+Launched application with dev.statonsoftware.glimmer-ios.hello bundle identifier.
+Waiting for the application to terminate…
+hello from Linux on tpb64l
+The app terminated with the exit code 0.
+#+end_example
+
+That is the line. A jolt program, compiled to portable bytecode, signed with
+an ordinary development certificate, running on an iPhone 16 Pro with no
+JIT entitlement, no debugger, and nothing generated at runtime — the shape
+the App Store permits. (=os.arch= reports the machine type; the same
+=os.name= family of upstream quirks, and as cosmetic.)
+
+** The counter, on the phone
+
+#+begin_example
+$ NS=demo.examples.counter TARGET=device jolt bundle && jolt device
+Launched application with dev.statonsoftware.glimmer-ios.hello bundle identifier.
+Waiting for the application to terminate…                    (it never does)
+$ xcrun devicectl device info processes --device $DEVICE | grep Hello.app
+7547   /private/var/containers/Bundle/Application/…/Hello.app/Hello
+
+$ NS=demo.smoke TARGET=device jolt bundle && jolt device
+smoke: posting from a worker thread
+smoke: tapped + 1 twice; state = {:count 2}
+#+end_example
+
+The counter runs on the iPhone and the smoke's round trip completes there —
+which proves more on =pb= than it did on the simulator: the delegate's
+=didFinishLaunchingWithOptions:= and =GlimmerTarget='s =fire:= are
+=foreign-callable=​s, and on portable bytecode those are libffi /closures/,
+not just calls. libffi's Apple closures come from a pre-built trampoline
+page, so no code is generated for them either.
+
+One difference from the simulator screenshots, noticed on the phone: the
+background is black. Dark mode — the root view is =systemBackgroundColor=
+and =UILabel= defaults to =labelColor=, both of which adapt; the simulator
+was in light mode. The one thing that does not adapt is the caption's
+hard-coded =#8e939d=, which is the macOS demo's markup verbatim.
+
+Milestone 5, then: met, and by the =pb= route, so most of milestone 6 came
+with it — the artifact that ran is signed with an ordinary development
+certificate and generates nothing at runtime. What remains of 6 is a
+distribution profile and an App Store Connect upload — paperwork rather than
+engineering, and not something this notebook plans to do: the experiment
+was whether it /could/ ship, and the artifact above answers that.
+
+* TODO
+
+Against [[https://github.com/jasalt/jolt-android-experiment/tree/6d2b291d8098d8abc76431b6d9f851b9ee329934/experiments][jasalt/jolt-android-experiment]] at =6d2b291= (42 experiments, self-graded
+"Level 5 — development-quality PoC"): on the UI seam this notebook is ahead —
+Android has no hiccup-driven native UI, its counter is Compose or raylib —
+and its build is shorter (no JNI, no PIC, no compaction-ABI patch: =jolt
+build --target= emits the whole executable). On everything /around/ the app,
+Android has ten experiments and this has none. In the order they should be
+done:
+
+1. +*Device* — milestones 5 and 6.+ Done, =pb= first (see Milestone 5): the
+   counter runs on an iPhone 16 Pro with no JIT and no debugger. 6 is
+   deferred on purpose: what is left of it is a distribution profile and an
+   App Store Connect upload.
+2. *Lifecycle* — background/foreground the counter (=simctl= can do both),
+   relaunch, an allocation stress like EXP-005. What does a parked Chez
+   thread do on =applicationDidEnterBackground:=?
+3. *Persistence* — a =:storage/write= effect to the Documents dir, restored on
+   a fresh launch (EXP-012's shape); the first effect-as-data on this side.
+4. +*nREPL in the simulator*+ Done, and on the phone too — see
+   [[file:examples/counter/README.org][examples/counter]], "Live". It cost the =os.name= landmine going off in
+   =jolt.nrepl='s socket constants; the app owns its listener now.
+5. *Clipboard / notification permission* — EXP-011/014; the delegate-callback
+   pattern for a system prompt.
+6. *A clean-room verifier* — EXP-016's fail-fast check, over Brewfile +
+   =jolt tangle= + =jolt test= + a simulator smoke.
+
+Not on the list, on purpose: a gesture layer (raylib's touch work has no
+analogue when =UIButton= is the input), and a second UI shape.
 
 * References
 
