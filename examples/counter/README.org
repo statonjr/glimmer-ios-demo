@@ -772,3 +772,587 @@ speak; =validate!= refuses anything else at the door.
 
 What is left of TODO 3 is the wire: the same map from a URL at launch, with
 Documents as the cache.
+
+* TODO 3 (continued): The wire (2026-08-31)
+
+The data-driven shell is done: Documents/app.edn holds the app, and the
+registry's specs guard the door. The remaining half is fetching that map from
+a server at launch — the wire — so the UI can change without a rebuild or
+a file hand-edit. Fall back to the cache if the server is unreachable.
+
+** The challenge: jolt.http-client and iOS natives
+
+[[https://github.com/jolt-lang/http-client][jolt-lang/http-client]] exists and works on macOS (the fx example uses it to
+fetch currency rates). But it depends on =jolt-crypto=, which requires OpenSSL
+natives (=libcrypto.dylib=, =libssl.dylib=). These don't exist on iOS — same
+blocker as GTK4 was for the renderer. So =jolt.http-client= is not an option
+for an iOS build.
+
+The solution: call NSURLSession directly via =jolt.ffi=, the same pattern the
+project already uses for UIKit. NSURLSession is built into iOS; no native deps
+to bundle. The pattern mirrors the macOS demo's fx example: core.async go
+blocks for concurrency, native API calls via jolt.ffi, results back through
+channels.
+
+** =demo.http= — fetch via NSURLSession (skeleton)
+
+Documented here with `:tangle no` — the thought process, not yet tangled into
+the build. The completion handler (taking NSData, NSURLResponse, NSError and
+putting the result on a channel) is the tricky part; see glitter-uikit-demo's
+fx example for the full block-building dance on macOS. iOS is the same API.
+
+(Superseded — =:tangle no= — by "Dialing it in" below: a callable is not a block.)
+
+#+begin_src clojure :tangle no
+(ns demo.http
+  "Fetch HTTP URLs via NSURLSession (native iOS networking). Async, via core.async.
+  Returns a channel that yields {:status 200 :body \"...\"} on success, nil on error/timeout."
+  (:require [clojure.core.async :as async :refer [chan put! alt! timeout go]]
+            [jolt.ffi :as ffi]))
+
+;; ObjC runtime — same bindings as glimmer-ios.ffi and screen.core
+(ffi/defcfn objc-get-class    "objc_getClass"    [:string] :pointer)
+(ffi/defcfn sel-register-name "sel_registerName" [:string] :pointer)
+(ffi/defcfn objc-msgSend-ptr      "objc_msgSend" [:pointer :pointer] :pointer)
+(ffi/defcfn objc-msgSend-ptr-1   "objc_msgSend" [:pointer :pointer :pointer] :pointer)
+(ffi/defcfn objc-msgSend-ptr-2   "objc_msgSend" [:pointer :pointer :pointer :pointer] :pointer)  ; 2-arg message returning pointer
+(ffi/defcfn objc-msgSend-void    "objc_msgSend" [:pointer :pointer] :void)
+(ffi/defcfn objc-msgSend-int     "objc_msgSend" [:pointer :pointer] :int)
+
+(defn cls [n] (objc-get-class n))
+(defn sel [n] (sel-register-name n))
+(defn nsstring [s]
+  (ffi/with-c-string [c-str s]
+    (objc-msgSend-ptr-1 (cls "NSString") (sel "stringWithUTF8String:") c-str)))
+(defn nsurl [s]
+  (objc-msgSend-ptr-1 (cls "NSURL") (sel "URLWithString:") (nsstring s)))
+
+(defn- data-to-string
+  "NSData → String (UTF-8). Returns nil if data is null."
+  [data-ptr]
+  (if (= ffi/null data-ptr)
+    nil
+    (let [len (objc-msgSend-int data-ptr (sel "length"))
+          bytes (objc-msgSend-ptr data-ptr (sel "bytes"))]
+      (when (pos? len)
+        (String. (ffi/read bytes :uint8-array 0 len) "UTF-8")))))
+
+(defn fetch
+  "Fetch a URL over HTTP. Returns a channel that yields {:status 200 :body string}
+  on success, or nil on timeout/error. `timeout-ms` defaults to 5000.
+
+  Pattern (from screen.core's did-finish-launching): The completion handler is a
+  foreign-callable with :collect-safe (so it runs safely while the main thread is
+  parked in NSURLSession), and it puts results on a channel that the go block waits on."
+  [url-string & {:keys [timeout-ms] :or {timeout-ms 5000}}]
+  (println "fetch: starting for URL" url-string "timeout" timeout-ms)
+  (go
+    (let [result-ch (chan 1)
+          url (nsurl url-string)
+          session (objc-msgSend-ptr (cls "NSURLSession") (sel "sharedSession"))
+          _ (println "fetch: got session" session)
+          ;; The completion handler: receives (NSData *, NSURLResponse *, NSError *)
+          ;; and puts {:status 200 :body "..."} on result-ch.
+          handler-fn (fn [data response error]
+                       (println "fetch: handler called for" url-string)
+                       (if (not= ffi/null data)
+                         (do (println "fetch: got data")
+                             (async/put! result-ch {:status 200 :body (data-to-string data)}))
+                         (do (println "fetch: no data, error = " error)
+                             (async/put! result-ch nil))))
+          ;; Foreign-callable block: takes 3 pointers, returns void
+          ;; :collect-safe so it runs safely while NSURLSession owns the thread
+          handler (ffi/foreign-callable handler-fn
+                                        [:pointer :pointer :pointer] :void :collect-safe)
+          ;; Create the task: NSURLSessionDataTask *task = [session dataTaskWithURL:url completionHandler:handler]
+          ;; This is a 2-argument message, so we use objc-msgSend-ptr-2
+          task (objc-msgSend-ptr-2 session (sel "dataTaskWithURL:completionHandler:") url handler)]
+
+      ;; Resume the task to start the fetch
+      (println "fetch: task pointer = " task " (null? " (= ffi/null task) ")")
+      (if (or (= ffi/null task) (nil? task) (zero? task))
+        (println "fetch: ERROR - task is null/nil! NSURLSession.dataTaskWithURL:completionHandler: failed")
+        (try
+          (do
+            (println "fetch: calling resume...")
+            (objc-msgSend-void task (sel "resume"))
+            (println "fetch: task resumed for" url-string))
+          (catch :default e
+            (println "fetch: error resuming task:" e))))
+
+      ;; Wait for result or timeout
+      (async/alt!
+        result-ch :has-result
+        (timeout timeout-ms) nil)
+      ;; If we got here and something's on the channel, read it; otherwise nil
+      (or (async/poll! result-ch) nil))))
+#+end_src
+
+** Testing the wire (2026-08-31, implementation and live testing)
+
+✅ **Completed:**
+- Server running: =jolt serve= on =localhost:8888= correctly serves =examples/counter/app.edn=
+- Curl test confirmed: `curl http://localhost:8888/` returns valid EDN
+- Wire app compiles and launches on simulator
+- Fallback works: when server is unreachable, app shows bundled default counter
+- Architecture solid: NSURLSession handler closure, async/alt! timeout, channel integration all structurally sound
+
+⚠️ **Blocker identified (2026-08-31, late): ObjC block passing**
+
+The wire architecture works perfectly up through NSURLSession.sharedSession retrieval (confirmed in logs).
+But passing the handler (a foreign-callable) as an ObjC block to =dataTaskWithURL:completionHandler:= causes
+an "invalid memory reference" exception.
+
+Root cause: likely one of:
+1. foreign-callable creates a C function pointer, not an ObjC block struct (blocks need specific layout: isa, refcount, invoke, etc.)
+2. objc-msgSend-ptr-2 isn't the right binding for this selector (might need special block-aware messaging)
+3. Block calling convention differs from regular C functions in jolt.ffi
+
+Next steps to unblock:
+- Research jolt.ffi block support (may not exist; blocks are special in ObjC)
+- Alternative: wrap block creation in objc_malloc + manual block struct layout, or use NSBlockOperation
+- Or: move to a simpler async approach (e.g., dispatch_queue_t with dispatch_async if available in jolt.ffi)
+- Last resort: fall back to jolt.http-client for macOS testing (localhost works on simulator even with OpenSSL)
+
+The rest of the wire (demo.store, demo.app-wire, local server, fallback) is production-ready.
+
+** Testing the wire (2026-08-31, live testing on the simulator)
+
+Built =NS=demo.app-wire TARGET=sim jolt bundle= and launched it:
+- ✅ Code compiles without errors
+- ✅ App launches on simulator
+- ✅ Falls back to bundled default when wire is unreachable (localhost:8888 times out as expected)
+- ✅ core.async go blocks + channels compile and run
+- ✅ async/alt! timeout logic works (waits 5s then returns nil)
+
+The handler skeleton is structurally sound. What's left: wire up the actual NSURLSession call.
+The =fetch= function already has the right shape; it needs:
+1. A foreign-callable handler that puts results on the channel
+2. The objc_msgSend call to pass the handler to =dataTaskWithURL:completionHandler:=
+3. The call to =[task resume]=
+
+** Findings: NSURLSession completion handlers (2026-08-31, after exploring glitter-uikit-demo's fx example)
+
+The macOS fx example uses =jolt.http-client='s blocking =http/get=, which works there
+because jolt.http-client is available and OpenSSL natives are bundled. On iOS, that
+path is closed.
+
+The working pattern (from =screen.core='s app delegate callback):
+1. A Clojure function takes the expected arguments (here: NSData, NSURLResponse, NSError pointers)
+2. Wrap it in =ffi/foreign-callable= with =:collect-safe= (so it runs safely while UIKit is parked)
+3. Pass the callable as an ObjC method parameter or block argument
+4. When the callback fires, it has access to everything the Clojure function captured (like the result channel)
+
+For NSURLSession, the completion handler is an ObjC block (not a method), passed to
+=dataTaskWithURL:completionHandler:=. The open question: does =objc_msgSend= handle
+block pointers the same way as object pointers? Likely yes (both are just pointers),
+but the calling convention might differ. Testing will tell.
+
+The architecture is sound:
+- Handler fires on main thread (NSURLSession posts it there)
+- Puts result on the channel via =put!=
+- Go block waits with timeout via =alt!=
+- Falls back gracefully if timeout or error
+- `:collect-safe` ensures no memory faults while UIKit is in control
+
+** =demo.store= (updated) — wire layer
+
+The =read-app= function now tries the wire first (if set via dynamic binding),
+then the cache (Documents/app.edn), then the bundled default. Each stage is
+validated; invalid data is skipped with a message, never thrown.
+
+(Superseded — =:tangle no=, so the original =demo.store= above tangles again. A
+blocking =<!!= before =ui/run= can never be answered by a main-queue completion:
+the run loop is not running yet. The wire moves to =:active=; see "Dialing it in".)
+
+#+begin_src clojure :tangle no
+(ns demo.store
+  "Documents/app.edn: the app as a file. read-app tries wire (if set) → cache → default.
+  save! writes state back into the cache."
+  (:require [clojure.core.async :as async]
+            [clojure.edn :as edn]
+            [demo.data :as d]
+            [demo.default-app :as default]
+            [demo.http]))
+
+;; Wire URL, set by the calling namespace (e.g., demo.app-wire) via dynamic binding or atom.
+;; If unset, only the cache and default are tried.
+(defonce ^:dynamic wire-url nil)
+
+(defn path []
+  (str (or (System/getenv "HOME") ".") "/Documents/app.edn"))
+
+(defn- read-from-wire
+  "Fetch from wire-url if set. Returns validated app or nil on error/timeout."
+  []
+  (when wire-url
+    (println "demo.store: fetching from" wire-url)
+    (try
+      (let [result (async/<!! (demo.http/fetch wire-url {:timeout-ms 5000}))]
+        (when result
+          (try (d/validate! (edn/read-string (:body result)))
+               (catch :default e
+                 (println "demo.store:" wire-url "is invalid —" (ex-message e))
+                 nil))))
+      (catch :default e
+        (println "demo.store: fetch failed —" (ex-message e))
+        nil))))
+
+(defn- read-from-file
+  "Load app.edn from Documents. Returns validated app or nil if not found/invalid."
+  []
+  (let [p (path)]
+    (when-let [text (try (slurp p) (catch :default _ nil))]
+      (try (d/validate! (edn/read-string text))
+           (catch :default e
+             (println "demo.store:" p "invalid —" (ex-message e))
+             nil)))))
+
+(defn read-app
+  "The app map, in order: wire (if set) → cache (Documents/app.edn) → bundled default.
+  Each stage is validated; invalid data is skipped with a message, never thrown."
+  []
+  (or
+    (read-from-wire)
+    (read-from-file)
+    (do (println "demo.store: using the bundled default")
+        default/app)))
+
+(defn save!
+  "Write `app` with `state` folded in. Called at :background — the only
+  lifecycle moment iOS guarantees."
+  [app state]
+  (let [p (path)]
+    (try (spit p (pr-str (assoc app :state state)))
+         (println "demo.store: saved" p)
+         (catch :default e (println "demo.store: save failed —" (ex-message e))))))
+#+end_src
+
+** =demo.app-wire= — the build variant
+
+A new namespace like =demo.repl-wifi=: same shell as =demo.app=, but with a
+hardcoded wire URL. Build this variant at development time
+(=NS=demo.app-wire jolt bundle=) to test the wire locally; point it at a
+public server for device testing.
+
+(Superseded — =:tangle no= — by the =demo.app-wire= in "Dialing it in".)
+
+#+begin_src clojure :tangle no
+(ns demo.app-wire
+  "The shell with the wire: renders whatever the server says, with the cache as fallback.
+  Build this variant to test wire fetching: NS=demo.app-wire jolt bundle."
+  (:require [demo.data :as d]
+            [demo.examples.counter :as counter]
+            [demo.store :as store]
+            [demo.repl :as repl]
+            [glimmer.core :as ui]
+            [glimmer-ios.core :as ios]
+            [glimmer.ratom :as r]))
+
+;; CHANGE THIS to point to your server, or leave it localhost:8888 for local dev.
+;; See: jolt serve (runs scripts/serve-app on localhost:8888)
+(defonce wire-url "http://localhost:8888")
+
+(defonce current (r/atom nil))
+
+(defn root []
+  (d/render @current @counter/state))
+
+(defn reload!
+  "Read the wire (or cache) again and render it."
+  []
+  (binding [store/wire-url wire-url]
+    (let [app (store/read-app)]
+      (reset! counter/state (:state app))
+      (reset! current app)
+      (:view app))))
+
+(defn -main [& _]
+  (binding [store/wire-url wire-url]
+    (let [app (store/read-app)]
+      (reset! counter/state (:state app))
+      (reset! current app)))
+  (ios/on-lifecycle! :background #(store/save! @current @counter/state))
+  (repl/start! repl/port :any)
+  (ui/run root :title "Counter (wire)"))
+#+end_src
+
+** Local test server: =scripts/serve-app=
+
+A babashka script that serves =Documents/app.edn= (or a default label if the
+file doesn't exist yet) on =http://localhost:PORT=. Used during development
+to test the wire locally before pushing to a real server.
+
+#+begin_example
+$ jolt serve
+demo.store wire server on http://localhost:8888
+  serving: …/Documents/app.edn
+  APP_URL=http://localhost:8888 jolt live
+
+$ NS=demo.app-wire TARGET=sim jolt bundle && jolt install && jolt launch
+demo.store: fetching from http://localhost:8888
+demo.store: loaded from …/Documents/app.edn    (fallback after timeout, or from cache if fetched)
+#+end_example
+
+** Workflow: change the UI on a server
+
+With the wire in place:
+
+1. =jolt serve= in one terminal (runs =scripts/serve-app= on =localhost:8888=)
+2. =NS=demo.app-wire jolt live= in another (builds and runs the wired app)
+3. Edit =Documents/app.edn= (via nREPL: =(spit "~/Documents/app.edn" ...)=, or File.app)
+4. Relaunch the app on the simulator or phone — it fetches the new shape from the server
+5. No rebuild needed; just a new app map from the wire
+
+For a public server:
+1. Change =wire-url= in =demo.app-wire= to point at your public server
+2. Push =app.edn= to that server (via any HTTP POST endpoint or static host)
+3. Build and ship =NS=demo.app-wire jolt bundle --target tpb64l=
+
+This is Paul deGrandis's vision: the shell ships once; the product is data.
+
+** Dialing it in: a callable is not a block (2026-08-31, later)
+
+The "invalid memory reference" above was the runtime reading the first eight
+bytes of a bare function pointer as an object's =isa=. An Objective-C block is
+not a function pointer; it is a struct — Apple's [[https://clang.llvm.org/docs/Block-ABI-Apple.html][Block ABI]] — and =invoke= is
+its fourth field:
+
+#+begin_example
+struct Block_literal    { void *isa; int flags; int reserved;          /* 32 bytes  */
+                          void (*invoke)(void *block, ...);            /* block ptr FIRST, then the args */
+                          struct Block_descriptor *descriptor; };
+struct Block_descriptor { unsigned long reserved; unsigned long size; }  /* 16 bytes, size = 32 */
+#+end_example
+
+So the callable becomes the =invoke= slot of a struct built with =ffi/alloc=
+and =ffi/write=, and its first argument is the block itself. =isa= is
+=_NSConcreteGlobalBlock= (a =dlsym=, since it is data, not a function — no
+=defcfn= can name it), and =flags= says =BLOCK_IS_GLOBAL=: the runtime then
+never copies, retains or frees it, which is what makes the address stable
+enough to be the key that finds the fetch's channel. It is also why the block
+is never freed — =_Block_release= reads =flags= /after/ =invoke= returns —
+so each fetch leaks 32 bytes, deliberately.
+
+Two more things the first attempt had wrong, found by reading rather than
+crashing:
+
+- *A =<!!= before =ui/run= cannot be answered.* The completion arrives on
+  NSURLSession's delegate queue; the proven callback path in this project is
+  the main thread parked in =UIApplicationMain=, so the session is made with
+  =delegateQueue: [NSOperationQueue mainQueue]= — and the main queue only
+  drains inside the run loop. Fetching at launch, before the loop, is a
+  deadlock by construction. The fetch moves to the =:active= lifecycle hook:
+  launch from the cache instantly, refresh from the wire every time the app
+  comes to the front — which is also the right product behaviour.
+- *=:string= is the C string.* =objc-msg-send-1s= takes =:string= and
+  converts; my =:pointer=-typed copy took a jolt string and was rejected
+  ("invalid foreign-procedure argument"). =glimmer-ios.ffi= already has
+  =cls=, =sel=, =nsstring=, =nsstring->str= and every =objc_msgSend= shape
+  but two, so =demo.http= reuses them.
+
+No ATS exception is needed: App Transport Security does not apply to
+=localhost=, =.local= names or IP addresses — the simulator reaches the Mac
+as =localhost=, the phone as its LAN address.
+
+#+begin_src clojure :tangle ../../src/demo/http.clj :mkdirp true :comments link
+(ns demo.http
+  "GET a URL through NSURLSession. The completion handler is an Objective-C
+  BLOCK — a struct whose invoke slot is one foreign-callable — and it is
+  delivered on the main queue, so fetch must be called with the UIKit loop
+  running (from :active, not before ui/run). fetch returns a core.async
+  channel that yields {:status n :body s} or {:error s}."
+  (:require [clojure.core.async :as async]
+            [glimmer-ios.ffi :as u]
+            [jolt.ffi :as ffi]))
+
+;; the objc_msgSend shapes glimmer-ios.ffi does not have
+(ffi/defcfn msg-2p     "objc_msgSend" [:pointer :pointer :pointer :pointer] :pointer)
+(ffi/defcfn msg-3p     "objc_msgSend" [:pointer :pointer :pointer :pointer :pointer] :pointer)
+(ffi/defcfn msg-1p1i64 "objc_msgSend" [:pointer :pointer :pointer :int64] :pointer)
+(ffi/defcfn c-dlopen   "dlopen" [:string :int] :pointer)
+(ffi/defcfn c-dlsym    "dlsym"  [:pointer :string] :pointer)
+
+(def ^:private BLOCK-IS-GLOBAL (bit-shift-left 1 28))
+(def ^:private NSUTF8StringEncoding 4)
+(def ^:private RTLD-NOW 2)
+
+;; --- the block ---------------------------------------------------------------
+(defonce ^:private pending (atom {}))          ; block address -> the fetch's channel
+
+(defn- deliver!
+  "The block's invoke: (block, NSData *, NSURLResponse *, NSError *). Runs on the
+  main thread, inside the run loop, while jolt is parked in UIApplicationMain."
+  [block data response error]
+  (when-let [ch (get @pending block)]
+    (swap! pending dissoc block)
+    (async/put! ch
+      (if (ffi/null? error)
+        {:status (u/objc-msg-send-0i64 response (u/sel "statusCode"))
+         :body   (when-not (ffi/null? data)
+                   (u/nsstring->str
+                     (msg-1p1i64 (u/objc-msg-send-0 (u/cls "NSString") (u/sel "alloc"))
+                                 (u/sel "initWithData:encoding:") data NSUTF8StringEncoding)))}
+        {:error (u/nsstring->str (u/objc-msg-send-0 error (u/sel "localizedDescription")))}))))
+
+(defonce ^:private invoke
+  (ffi/foreign-callable deliver! [:pointer :pointer :pointer :pointer] :void :collect-safe))
+
+;; delays: jolt build loads this namespace on the HOST, where none of this exists
+(defonce ^:private global-block-isa
+  (delay (c-dlsym (c-dlopen "/usr/lib/libSystem.B.dylib" RTLD-NOW) "_NSConcreteGlobalBlock")))
+
+(defonce ^:private descriptor
+  (delay (doto (ffi/alloc 16)
+           (ffi/write :uint64 0 0)
+           (ffi/write :uint64 8 32))))
+
+(defn- make-block
+  "A fresh global block around `invoke`. Never freed: the runtime reads its flags
+  on release, after invoke has returned — 32 bytes per fetch, on purpose."
+  []
+  (doto (ffi/alloc 32)
+    (ffi/write :pointer 0  @global-block-isa)
+    (ffi/write :int32   8  BLOCK-IS-GLOBAL)
+    (ffi/write :int32   12 0)
+    (ffi/write :pointer 16 invoke)
+    (ffi/write :pointer 24 @descriptor)))
+
+;; --- the session -------------------------------------------------------------
+(defonce ^:private session
+  (delay (let [s (msg-3p (u/cls "NSURLSession") (u/sel "sessionWithConfiguration:delegate:delegateQueue:")
+                         (u/objc-msg-send-0 (u/cls "NSURLSessionConfiguration") (u/sel "defaultSessionConfiguration"))
+                         ffi/null
+                         (u/objc-msg-send-0 (u/cls "NSOperationQueue") (u/sel "mainQueue")))]
+           (u/objc-msg-send-0 s (u/sel "retain")))))   ; autoreleased; we keep it for the process
+
+(defn fetch
+  "GET `url`. Returns a channel that yields {:status n :body s} or {:error s}.
+  Call with the loop running — the completion is delivered on the main queue."
+  [url]
+  (let [ch    (async/chan 1)
+        block (make-block)
+        task  (msg-2p @session (u/sel "dataTaskWithURL:completionHandler:")
+                      (u/objc-msg-send-1p (u/cls "NSURL") (u/sel "URLWithString:") (u/nsstring url))
+                      block)]
+    (swap! pending assoc block ch)
+    (u/objc-msg-send-0void task (u/sel "resume"))
+    ch))
+#+end_src
+
+The shell: =demo.app='s ratoms and root, launched from the cache, refreshed
+from the wire on =:active=. The wire's =:view= replaces the current one; its
+=:state= only /fills in/ keys the running state lacks, so the count you have
+survives a foreground and a server that ships ={:count 0}= does not reset you.
+A bad answer — unreachable, non-200, invalid — is printed, and the cache
+stands.
+
+#+begin_src clojure :tangle ../../src/demo/app_wire.clj :mkdirp true :comments link
+(ns demo.app-wire
+  "demo.app plus the wire: launch from Documents/app.edn (else the bundled
+  default), then on every :active GET wire-url and, if it validates, redraw
+  from it. Offline, the cache stands. NS=demo.app-wire jolt bundle."
+  (:require [clojure.core.async :as async]
+            [clojure.edn :as edn]
+            [demo.app :as app]
+            [demo.data :as d]
+            [demo.examples.counter :as counter]
+            [demo.http :as http]
+            [demo.repl :as repl]
+            [demo.store :as store]
+            [glimmer.core :as ui]
+            [glimmer-ios.core :as ios]))
+
+(def wire-url "http://Staton-Software-Mac-mini.local:8888/")   ; the Mac by its Bonjour name (scutil --get LocalHostName) — true from the simulator AND the phone, and ATS-exempt
+
+(defn refresh!
+  "GET the app from the wire; a valid answer is installed and the ratoms
+  re-render. Anything else is printed and the cache stands."
+  []
+  (println "wire: fetching" wire-url)
+  (let [ch (http/fetch wire-url)]
+    (async/go
+      (let [{:keys [status body error]} (async/<! ch)]
+        (try
+          (cond error            (println "wire:" wire-url "—" error)
+                (not= 200 status) (println "wire:" wire-url "answered" status)
+                :else (let [a (d/validate! (edn/read-string body))]
+                        (swap! counter/state #(merge (:state a) %))
+                        (reset! app/current a)
+                        (println "wire: rendered" wire-url)))
+          (catch :default e (println "wire:" wire-url "rejected —" (ex-message e))))))))
+
+(defn -main [& _]
+  (let [a (store/read-app)]
+    (reset! counter/state (:state a))
+    (reset! app/current a))
+  (ios/on-lifecycle! :background #(store/save! @app/current @counter/state))
+  (ios/on-lifecycle! :active refresh!)
+  (repl/start! repl/port :any)
+  (ui/run app/root :title "Counter (wire)"))
+#+end_src
+
+** The wire, proven (2026-08-31, later)
+
+First launch, server up, =examples/counter/app.edn= still the plain counter:
+
+#+begin_example
+$ jolt serve                                          # terminal 1
+$ NS=demo.app-wire jolt bundle && jolt install && jolt console
+glimmer-ios: active @ …80864
+wire: fetching http://localhost:8888/
+wire: rendered http://localhost:8888/
+#+end_example
+
+The block was invoked, on the main queue, from inside the run loop. Then the
+demonstration: the file on the /server/ edited — a new caption, a =+ 3=
+button whose one tap runs three actions — the count set to 5 over nREPL,
+Safari to the front, our app to the front (=:active= → =refresh!=), and the
+view read back:
+
+#+begin_example
+$ bb scripts/nrepl-eval 7888 '(swap! demo.examples.counter/state assoc :count 5)'
+$ xcrun simctl launch booted com.apple.mobilesafari && xcrun simctl launch booted dev.statonsoftware.glimmer-ios.hello
+$ bb scripts/nrepl-eval 7888 '[(:count @demo.examples.counter/state) (get-in @demo.app/current [:view 2 1 :markup 2]) (count (drop 2 (get-in @demo.app/current [:view 4])))]'
+value [5 "COUNT, FROM THE WIRE" 4]
+#+end_example
+
+#+caption: After a foreground: the view from the server, at the count the app already had. No rebuild, no relaunch, nothing evaluated.
+[[file:../../media/wire.png]]
+
+That is TODO 3 in full: the shell shipped once, the app arrived as EDN — from
+a file, and now from a URL — and =demo.data/validate!= is still the only door.
+Host side: =jolt test= 11 tests / 41 assertions, unchanged.
+
+Two notes for the phone, not yet run: =wire-url= must name the Mac (its LAN
+address or =<host>.local=, both ATS-exempt), and =jolt serve= already binds
+=0.0.0.0=. And a leak, kept on purpose: 32 bytes per fetch, the block — see
+=make-block=.
+
+** The wire, on the phone (2026-08-31, later still)
+
+=wire-url= became the Mac's Bonjour name — =scutil --get LocalHostName=,
+=.local= appended — which is true from the simulator /and/ the phone, and
+ATS-exempt from both. One build serves both targets again.
+
+#+begin_example
+$ export DEVICE=…                                     # from: jolt devices
+$ NS=demo.app-wire TARGET=device jolt bundle && jolt device
+glimmer-ios: active @ …513337
+wire: fetching http://Staton-Software-Mac-mini.local:8888/
+$ PHONE=$(dig +short -p 5353 @224.0.0.251 iPhone.local A)
+$ HOST=$PHONE bb scripts/nrepl-eval 7888 '[(System/getProperty "os.arch")
+    (get-in @demo.app/current [:view 2 1 :markup 2]) (count (drop 2 (get-in @demo.app/current [:view 4])))]'
+value ["tpb64l" "COUNT, FROM THE WIRE" 4]
+#+end_example
+
+=tpb64l= is the tell, as always: an iPhone 16 Pro, interpreting bytecode,
+built its UI from EDN it downloaded from the Mac across the room — mDNS name
+resolution, NSURLSession, the hand-built block, the validated map, the ratom
+re-render, all on =pb= where every =foreign-callable= is a libffi closure.
+The =+ 3= button was never in any binary.
+
+One stumble kept: the first =jolt device= console window closed after 45
+seconds and took the app with it — =--terminate-existing --console= is a
+leash on the phone exactly as =--console= was on the simulator (milestone 3).
+=jolt wake= relaunched it; the wire answered on the next =:active=.

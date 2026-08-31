@@ -4,7 +4,7 @@
 
 * Introduction
 
-An experiment: run a [[https://github.com/burinc/glitter][glitter]] app on iOS, with a renderer over *UIKit* the way
+An virtual machine: run a [[https://github.com/burinc/glitter][glitter]] app on iOS, with a renderer over *UIKit* the way
 [[https://github.com/burinc/glitter-uikit][glitter-uikit]] renders over AppKit — same reconciler, same hiccup, same
 state-atom pattern, a new toolkit behind the seam. The goal of the first
 milestone is deliberately small: the counter from
@@ -529,7 +529,9 @@ once, from any Emacs.
         weavejester/hiccup {:git/url "https://github.com/weavejester/hiccup"
                             :git/sha "b6b12097ba973141fe87c1b4d6a27ddcce5d5929"}
         ;; terminal under jolt (org.clojure/clojure contributes no children)
-        org.clojure/spec.alpha {:mvn/version "0.5.238"}}
+        org.clojure/spec.alpha {:mvn/version "0.5.238"}
+        ;; TODO 3 wire: async fetch via NSURLSession (core.async go blocks)
+        org.clojure/core.async {:mvn/version "1.6.673"}}
  :aliases {:test {:extra-paths ["test"] :main-opts ["-m" "glimmer-ios.test-runner"]}}
 
  ;; README.org is the source of truth; `jolt tangle` regenerates this file,
@@ -566,7 +568,9 @@ once, from any Emacs.
          ;; media/counter.mov (a macOS screen recording of the simulator) → the two
          ;; shareable forms: H.264 mp4 for Slack/the web (faststart, 30 fps, 1080 tall),
          ;; and a palette GIF for the README (GitHub inline-plays GIFs, not video files).
-         media   "ffmpeg -v error -y -i media/counter.mov -vf 'fps=30,scale=-2:1080' -c:v libx264 -profile:v high -pix_fmt yuv420p -crf 23 -preset slow -movflags +faststart -an media/counter.mp4 && ffmpeg -v error -y -i media/counter.mov -vf 'fps=12,scale=-2:720:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=5' media/counter.gif"}}
+         media   "ffmpeg -v error -y -i media/counter.mov -vf 'fps=30,scale=-2:1080' -c:v libx264 -profile:v high -pix_fmt yuv420p -crf 23 -preset slow -movflags +faststart -an media/counter.mp4 && ffmpeg -v error -y -i media/counter.mov -vf 'fps=12,scale=-2:720:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=5' media/counter.gif"
+         ;; TODO 3 wire: serve app.edn from a local HTTP server for testing
+         serve   "bb scripts/serve-app ${PORT:-8888}"}}
 #+end_src
 
 What Homebrew does /not/ replace is the =~/dev/ChezScheme= checkout: =make
@@ -1082,7 +1086,10 @@ committed.
            jolt.ffi/with-c-string-array clojure.core/let
            jolt.ffi/with-alloc          clojure.core/let
            jolt.ffi/with-out            clojure.core/let
-           jolt.ffi/with-layout         clojure.core/let}}
+           jolt.ffi/with-layout         clojure.core/let}
+ ;; alloc/free/read/write/null/null? are host-provided (see jolt.ffi's docstring):
+ ;; no defn in ffi.clj for kondo to resolve, so every use read as unresolved.
+ :linters {:unresolved-var {:exclude [jolt.ffi]}}}
 #+end_src
 
 ** On the screen
@@ -1688,8 +1695,13 @@ done:
    App Store Connect upload.
 2. +*Lifecycle*+ Done — see the Lifecycle section. A plain launch resumes;
    =applicationWillTerminate:= is a fiction; persist at =:background=.
-3. *The app reads itself from EDN* — +the file: done+ (see [[file:examples/counter/README.org][examples/counter]], "The app
-   as data"); the wire remains. Paul deGrandis's shape (Vase, "Unlocking
+3. +*The app reads itself from EDN*+ — the file: done (see [[file:examples/counter/README.org][examples/counter]], "The app
+   as data"); the wire: done, simulator and phone ("Dialing it in" — a
+   hand-built ObjC block around one =foreign-callable=, NSURLSession on the
+   main queue, refreshed at =:active=; the phone fetches from the Mac's
+   =.local= name over Wi-Fi). Not
+   =jolt.http-client=: it drags =jolt-crypto='s OpenSSL natives, which is the
+   GTK4 wall again. Paul deGrandis's shape (Vase, "Unlocking
    data-driven systems", 2015): the shell ships once, the /product/ is data.
    Most of it is already here — hiccup views, =[[:action/inc]]= through the
    registry's specs, a ratom of a map, an interpreter on =pb= that generates
