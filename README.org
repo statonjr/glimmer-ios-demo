@@ -473,6 +473,8 @@ mas  "Xcode", id: 497799835  # the iOS SDK, simulator runtimes and simctl; then 
 brew "xcodegen"             # a throwaway Xcode project, so Xcode mints the signing cert + profile (milestone 5)
 brew "libimobiledevice"     # iproxy: a TCP port on the phone, over USB, for nREPL (TODO 4)
 brew "rlwrap"               # arrows + history for `jolt connect` (clj needs it too)
+brew "librsvg"              # rsvg-convert: the app icon from media/jolt.svg
+brew "imagemagick"          # crop, flatten and resize it
 #+end_src
 
 The =.gitignore= tangles from here too — it is toolchain residue, and the
@@ -813,6 +815,7 @@ plist is tangled, the binary is built, nothing in it is source.
   <key>UIDeviceFamily</key>            <array><integer>1</integer></array>
   <key>LSRequiresIPhoneOS</key>        <true/>
   <key>UILaunchScreen</key>            <dict/>   <!-- without it iOS letterboxes the app (see milestone 3) -->
+  <key>CFBundleIcons</key>             <dict><key>CFBundlePrimaryIcon</key><dict><key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>  <!-- AppIcon60x60@2x/@3x.png, from scripts/icon -->
 </dict>
 </plist>
 #+end_src
@@ -1250,6 +1253,7 @@ JOLT_TARGET_ARCH_FLAG="$ARCH" \
 JOLT_TARGET_LINK_LIBS="-L$PACK/lib -llz4 -lz $EXTRA -framework Foundation -liconv -lm" \
   jolt build -m "$NS" -o Hello.app/Hello --target "$MACHINE" --target-pack "$PACK"
 rm -rf Hello.app/Hello.build
+sh scripts/icon
 #+end_src
 ** Minting a signature without an Xcode project
 
@@ -1480,6 +1484,31 @@ certificate and generates nothing at runtime. What remains of 6 is a
 distribution profile and an App Store Connect upload — paperwork rather than
 engineering, and not something this notebook plans to do: the experiment
 was whether it /could/ ship, and the artifact above answers that.
+
+* The icon
+
+The tile on [[https://jolt-lang.net/][jolt-lang.net]] — =media/jolt.svg=, kept here as it was fetched —
+is already drawn as an app icon: a =#161b22= rounded square (=x=44 y=44=,
+512 of a 600 viewBox, =rx=64=) with a drop shadow, on a transparent canvas.
+iOS applies its own rounded mask to whatever it is given, so the SVG as-is
+would round twice and show its margin. The recipe crops to the tile's box
+and flattens onto the tile colour, so the square is full-bleed and iOS does
+the corners; iOS wants no alpha, and 120 and 180 px for an iPhone.
+Without an asset catalog the plist names the files instead:
+=CFBundleIcons= → =CFBundlePrimaryIcon= → =CFBundleIconFiles=.
+
+#+begin_src sh :tangle scripts/icon :mkdirp true :comments link
+# jolt icon: media/jolt.svg → Hello.app/AppIcon60x60@{2x,3x}.png (called by scripts/bundle)
+set -eu
+mkdir -p Hello.app
+T=$(mktemp -d)
+rsvg-convert -w 1200 -h 1200 media/jolt.svg -o "$T/full.png"       # 600 units → 1200 px: the 512 tile is 1024
+magick "$T/full.png" -crop 1024x1024+88+88 +repage \
+  -background '#161b22' -alpha remove -alpha off "$T/1024.png"       # the tile, corners filled, no alpha
+magick "$T/1024.png" -resize 180x180 Hello.app/AppIcon60x60@3x.png
+magick "$T/1024.png" -resize 120x120 Hello.app/AppIcon60x60@2x.png
+rm -rf "$T"
+#+end_src
 
 * TODO
 
