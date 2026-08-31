@@ -49,7 +49,7 @@ Decisions made in the brainstorm (2026-08-31):
 | namespace | notebook | origin |
 |-----------+----------+--------|
 | =glimmer-ios.ffi= | =glimmer-ios/ffi.org= | glimmer-uikit =ffi.clj=: msgSend arities, =sel=/=cls= caches, =nsstring=, attributed strings, CF run loop — verbatim. AppKit helper section replaced by UIKit helpers. |
-| =glimmer-ios.widget= | =glimmer-ios/widget.org= | glimmer-uikit =widget.clj=: markup validation and Pango→attributed parser verbatim; spec machinery, universal props, child management verbatim; four specs; =GlimmerTarget= over =addTarget:action:forControlEvents:=. |
+| =glimmer-ios.widget= | =glimmer-ios/widget.org= | glimmer-uikit =widget.clj=: markup validation and Pango→attributed parser verbatim; spec machinery, universal props, child management verbatim; four entries in =specs= — =:window= (container kind only, no ctor: it is the root =mount-root!= receives), =:box= (=:vbox=/=:hbox= alias onto it), =:label=, =:button=; =GlimmerTarget= over =addTarget:action:forControlEvents:=. |
 | =glimmer-ios.core= | =glimmer-ios/core.org= | scheduler (with =swap-vals!=), =run*= from the milestone-3 spike, backend map, =install!=. |
 | =demo.registry= | =examples/counter/README.org= | the macOS demo's action pipeline only. |
 | =demo.examples.counter= | =examples/counter/README.org= | the counter. |
@@ -60,11 +60,30 @@ Decisions made in the brainstorm (2026-08-31):
 
 Tangle paths inside each notebook are relative (=../src/glimmer_ios/ffi.clj=,
 =../../src/demo/registry.clj=), as the macOS demo does it. The =tangle= task
-becomes =find . -name '*.org' -not -path './Hello.app/*' | xargs -I{} emacs …=.
+becomes =find . -name '*.org' -not -path './Hello.app/*' -not -path './docs/*' | xargs -I{} emacs …=
+(=docs/= holds specs whose blocks are all =:tangle no=; excluding it removes the
+footgun for the next one).
 README.org gains a milestone-4 section that links each notebook and records
 results and mistakes, and no longer tangles code of its own beyond what it
 already does (=Brewfile=, =.gitignore=, =deps.edn=, =.clj-kondo/config.edn=,
 =Info.plist=, the two spikes).
+
+** What =glimmer-ios.ffi= adds to the arity table
+
+"Verbatim" covers the existing bindings; UIKit needs a few glimmer-uikit
+never had, listed here so the notebook does not discover them one crash at a
+time:
+
+| binding | for |
+|---------+-----|
+| =[:pointer :pointer :pointer :pointer :int64] :void= | =addTarget:action:forControlEvents:= — =UIControlEvents= is =NSUInteger=, so =:int64=, not the =:int= of =objc-msg-send-3pchar= |
+| =[:pointer :pointer :double :double] :pointer= | =systemFontOfSize:weight:= (only the =:void= variant exists) |
+| =[:pointer :pointer :pointer :int64] :void= | =setTitle:forState:= (exists as =1p1i64void=) |
+| =[:int :pointer :pointer :pointer] :int :blocking= | =UIApplicationMain= (from the spike) |
+
+And two AppKit habits that do not carry: =UIStackView= has no
+=stackViewWithViews:= — it is =alloc=/=init= — and the orientation getter
+=maybe-align!= reads is =axis=, not =orientation=.
 
 ** Dependencies
 
@@ -78,7 +97,9 @@ already does (=Brewfile=, =.gitignore=, =deps.edn=, =.clj-kondo/config.edn=,
         ;; terminal under jolt (org.clojure/clojure contributes no children), so
         ;; spec must be declared here — the macOS notebook's finding.
         org.clojure/spec.alpha {:mvn/version "0.5.238"}}
- :aliases {:test {:extra-paths ["test"] :main-opts ["-m" "glimmer-ios.test-runner"]}}}
+ :aliases {:test {:extra-paths ["test"] :main-opts ["-m" "glimmer-ios.test-runner"]}}
+ ;; the existing tasks (tangle bundle install launch console) are retained; add:
+ :tasks {test "jolt -M:test"}}
 #+end_src
 
 No =:jolt/native=. UIKit is loaded by =glimmer-ios.core/load-uikit!= from inside
@@ -109,8 +130,9 @@ Pins match glimmer-uikit's so the fork stays a diff against a fixed base.
 
 =application:didFinishLaunchingWithOptions:= (a =:collect-safe=
 foreign-callable returning =:uint8=): =[[UIWindow alloc] init]=, a
-=UIViewController=, then =(mount-root! (view-of vc) :window)=, then
-=makeKeyAndVisible=. The window is held in an atom.
+=UIViewController=, =setRootViewController:= on the window, then
+=(mount-root! (view-of vc) :window)=, then =makeKeyAndVisible=. The window is
+held in an atom.
 
 The root container tag is =:window=. =append-child!= for =:window= adds the
 child to the controller's view and pins it to =safeAreaLayoutGuide= — top,
@@ -125,19 +147,26 @@ The CFRunLoopSource scheduler from glimmer-uikit, with two changes:
   glitter-uikit P3.T2 correction. A concurrent =(swap! queue conj work)= either
   lands in =jobs= or survives for the next signal; the deref-then-reset original
   could lose it silently.
-- Created lazily on first =schedule= (a =delay=), not at namespace load, because
-  namespace load happens on the host during =jolt build=.
+- Created lazily (a =delay=), not at namespace load, because namespace load
+  happens on the host during =jolt build=. The delegate callback forces it, on
+  the main thread, just before =makeKeyAndVisible= — so the first post from any
+  thread (the smoke's =future=, say) is a plain signal + wake-up and never the
+  one that creates the source.
 
 =CFRunLoopGetMain=, =CFRunLoopSourceCreate=, =CFRunLoopAddSource=,
 =CFRunLoopSourceSignal=, =CFRunLoopWakeUp= and the =CFRunLoopSourceContext=
 layout are CoreFoundation and identical on iOS. =kCFRunLoopDefaultMode= is
-created with =CFStringCreateWithCString= as glimmer-uikit does.
+created with =CFStringCreateWithCString= as glimmer-uikit does — inside the
+same =delay=, not as a load-time =def=.
+
+The backend map is registered under =:name :ios=.
 
 ** Dropped
 
 =quit!=, =:auto-quit-ms=, =terminate-app!= (an iOS app neither quits nor may
 =exit()=); the nREPL main-thread hop in =run!= (no =jolt nrepl-server= inside a
-bundle); =:tooltip=; the =:window= /tag/ (the root container kind stays).
+bundle); =:tooltip=. =:window= loses its =:ctor= (no hiccup ever creates a
+window here) but stays in =specs= so =container-kind= resolves for the root.
 
 =:reorder-child!= is kept — =insertArrangedSubview:atIndex:= exists — so keyed
 reconciliation is complete even though the counter never reorders.
@@ -154,7 +183,7 @@ Same alias/orientation sugar as glimmer-uikit. Prop mapping:
 | =:homogeneous= | =setDistribution:= — =FillEqually= (1) / =Fill= (0) |
 | =:orientation= | =setAxis:= — =Vertical= (1) / =Horizontal= (0); the selector is not AppKit's =setOrientation:= |
 | =:margin= and =:margin-top/-left/-bottom/-right/-start/-end= | =setLayoutMargins:= (=UIEdgeInsets=: four doubles, HFA in d0–d3) *and* =setLayoutMarginsRelativeArrangement:YES= |
-| =:halign= / =:valign= | =setAlignment:= on the parent stack — leading 1, center 3, trailing 4 |
+| =:halign= / =:valign= | =setAlignment:= on the parent stack — leading 1, center 3, trailing 4 (=->stack-alignment= is rewritten for these values; it returned =NSLayoutAttribute=s) |
 | =:hexpand= / =:vexpand= | =setContentHuggingPriority:forAxis:= |
 
 Children: =addArrangedSubview:=, =removeArrangedSubview:= followed by
@@ -163,6 +192,13 @@ subview otherwise), =insertArrangedSubview:atIndex:=.
 
 The README's prediction — =UIStackView= ignores =layoutMargins= unless
 =isLayoutMarginsRelativeArrangement= is YES — is why both calls are made.
+
+One default differs and is decided here: =UIStackView= aligns =fill= (0) on
+the cross axis where =NSStackView= centers. Left alone, the counter's two
+labels would be full-width and left-aligned — a verbatim view that does not
+look like the macOS one. The =:box= ctor therefore sets =setAlignment:= center
+(3), so the AppKit default is the iOS default too; =:halign=/=:valign=
+override it per the table.
 
 ** =:label= → =UILabel=
 
@@ -175,8 +211,13 @@ for =:ellipsize=.
 =buttonWithType:= system (1), =setTitle:forState:= normal (0), =setEnabled:=.
 Events: =addTarget:action:forControlEvents:= with =TouchUpInside= (1 << 6),
 target the shared =GlimmerTarget= instance, action =fire:=. The pointer-keyed
-=actions= registry and the =:collect-safe= IMP are glimmer-uikit's, unchanged.
-Only =:on-click= is wired; the =signals= atom keeps the extension shape.
+=actions= registry and the =:collect-safe= IMP are glimmer-uikit's, unchanged
+— except that the instance is a =delay= forced by =connect-signals!=, not a
+load-time =defonce=: the same rule as the scheduler, applied consistently.
+glimmer-uikit's =defonce invoker= calls =objc_getClass= at namespace load,
+which happens to work on a macOS host and cannot on Linux CI, where the
+headless tests must also run. Only =:on-click= is wired; the =signals= atom
+keeps the extension shape.
 
 ** Markup → attributed string
 
@@ -189,10 +230,10 @@ changes is confined to two functions:
   13.
 - =color-hex=: =UIColor colorWithRed:green:blue:alpha:=.
 
-Attribute-name constants (=NSFontAttributeName=, =NSForegroundColorAttributeName=,
-=NSStrikethroughStyleAttributeName=, =NSUnderlineStyleAttributeName=) are
-=NSString= globals read through =dlsym=, as glimmer-uikit does; they are the
-same names on iOS.
+Attribute keys are the literal string values glimmer-uikit already uses —
+="NSFont"=, ="NSColor"=, ="NSStrikethrough"=, ="NSUnderline"= — wrapped by
+=attributed-add!= with =nsstring=. Those are the values of the same constants
+on iOS, so this ports unchanged; nothing is read through =dlsym=.
 
 ** =:text->element=
 
@@ -230,7 +271,11 @@ under glimmer a button delivers nothing but the click.
 #+end_src
 
 Four arrows in the view and state; the =register-example!= call becomes
-=-main=. Everything else is the macOS demo's text. The deref inside =root= is
+=-main=. The =ns= form's requires change too — =glimmer.ratom :as r=,
+=glimmer.core :as ui= and =glimmer-ios.core= (for its install side effect)
+join =demo.registry= and =spec.alpha= — which is exactly the "unchanged except
+the requires" the README's introduction promised. Everything else is the
+macOS demo's text. The deref inside =root= is
 what makes it reactive: glimmer tracks the ratom read and re-renders =root= on
 =swap!=, reconciling the label in place.
 
@@ -266,11 +311,16 @@ counter exercises the scheduler every tap.
   injection, Pango rejection). Nothing in it touches UIKit; it runs on macOS
   and Linux CI. =clj-kondo --lint src test= at 0 errors, 0 warnings; the
   tangled =.clj-kondo/config.edn= already covers the FFI macros.
-- *Simulator, no finger*: =demo.smoke= runs the counter and, one second after
-  launch, schedules through the backend's own =:schedule= a thunk that locates
+- *Simulator, no finger*: =demo.smoke= runs the counter and, from a =future=
+  that sleeps one second (so the post comes from a thread that is not the main
+  loop — an actual exercise of the =swap-vals!= drain), schedules through the
+  backend's own =:schedule= a thunk that locates
   the =+ 1= button via =glimmer-ios.core/root-inst= and glimmer's instance
   tree, calls =sendActionsForControlEvents:= (TouchUpInside) on it twice, then
-  prints =@state=. Expected on =jolt console=: ={:count 2}=. This proves the
+  prints =@state=. The =future= is started /before/ =ui/run= (which never
+  returns), the pattern glimmer-uikit's =main_thread_smoke= establishes; it
+  ships as =NS=demo.smoke jolt bundle=. Expected on =jolt console=:
+  ={:count 2}=. This proves the
   full round trip in the diagram above, including the marshalling the scheduler
   exists for.
 - *Simulator, eyes*: =simctl io screenshot= after the smoke; the chrome
@@ -295,6 +345,13 @@ counter exercises the scheduler every tap.
   struct is /returned/ anywhere in this design.
 - *glimmer-uikit's =terminate-cb= returns =1= as =:char=* — the latent bug found
   in milestone 3. Nothing here copies it; every =BOOL= return is =:uint8=.
+
+* Order of work
+
+One plan, two checkpoints: *backend + headless tests green* (the three
+=glimmer-ios= notebooks, =jolt test=, =clj-kondo=) before *counter + smoke on
+the simulator* (=examples/counter/README.org=). The backend map is the
+interface between the halves, so the first is testable without the second.
 
 * Out of scope
 
