@@ -1155,7 +1155,11 @@ No ATS exception is needed: App Transport Security does not apply to
 =localhost=, =.local= names or IP addresses — the simulator reaches the Mac
 as =localhost=, the phone as its LAN address.
 
-#+begin_src clojure :tangle ../../src/demo/http.clj :mkdirp true :comments link
+(Superseded — =:tangle no= — by "Content negotiation": =fetch= grew a
+=:headers= option, which meant =NSMutableURLRequest= and
+=dataTaskWithRequest:=. The block machinery is unchanged there.)
+
+#+begin_src clojure :tangle no
 (ns demo.http
   "GET a URL through NSURLSession. The completion handler is an Objective-C
   BLOCK — a struct whose invoke slot is one foreign-callable — and it is
@@ -1247,7 +1251,10 @@ survives a foreground and a server that ships ={:count 0}= does not reset you.
 A bad answer — unreachable, non-200, invalid — is printed, and the cache
 stands.
 
-#+begin_src clojure :tangle ../../src/demo/app_wire.clj :mkdirp true :comments link
+(Superseded — =:tangle no= — by "Content negotiation": the shell grew a =lang=
+atom and the =:action/set-lang= vocabulary.)
+
+#+begin_src clojure :tangle no
 (ns demo.app-wire
   "demo.app plus the wire: launch from Documents/app.edn (else the bundled
   default), then on every :active GET wire-url and, if it validates, redraw
@@ -1356,3 +1363,302 @@ One stumble kept: the first =jolt device= console window closed after 45
 seconds and took the app with it — =--terminate-existing --console= is a
 leash on the phone exactly as =--console= was on the simulator (milestone 3).
 =jolt wake= relaunched it; the wire answered on the next =:active=.
+
+* Content negotiation: the app in French (2026-08-31)
+
+The wire serves one resource at one URL. Whose language it arrives in is
+/negotiation/, and HTTP already has the machinery: the request carries
+=Accept-Language=, the server picks a representation and answers with
+=Content-Language= and =Vary: Accept-Language=. Not =?lang=fr= — a query
+param is the URL pretending to be an API, and it mints a second resource
+where there is one.
+
+Two acts.
+
+*Act one costs no client code at all*: NSURLSession sends an
+=Accept-Language= on its own, derived from the device's language settings.
+A phone set to French asks for French without being told to. The server
+just has to listen.
+
+*Act two* puts the choice /in the downloaded app/: the view gains
+=English= / =Français= buttons whose actions are =[[:action/set-lang "fr"]]=
+— a new kind in the registry's vocabulary, whose interpretation is "remember
+the language, refetch." The labels translate; the vocabulary does not —
+=:action/inc= is the same word in both files, because the registry is code
+and the door does not move. And the French app carries the way back to
+English, since the toggle rides inside the data.
+
+** The server learns to listen
+
+A confession first: =scripts/serve-app= had been a loose file, written
+directly and never tangled — the only script in the project outside the
+notebook. It moves in here, and learns negotiation on the way. The parse
+honors q-values the cheap way (stable sort, primary subtags only), which is
+enough for real =Accept-Language= strings like =fr-CA,fr;q=0.9,en;q=0.8=.
+
+#+begin_src clojure :tangle ../../scripts/serve-app :mkdirp true
+#!/usr/bin/env bb
+;; scripts/serve-app [PORT] — the wire, negotiated. One URL; Accept-Language
+;; picks examples/counter/app.edn (en) or app_fr.edn (fr). `jolt serve`.
+(require '[org.httpkit.server :as http]
+         '[clojure.string :as str])
+
+(def files {"en" "examples/counter/app.edn"
+            "fr" "examples/counter/app_fr.edn"})
+
+(defn negotiate
+  "The first primary subtag, in q order, that we have a file for; else en."
+  [accept]
+  (let [tags (for [part (str/split (or accept "") #",")
+                   :let [[tag q]  (str/split (str/trim part) #";\s*q=")
+                         primary  (first (str/split (str/trim tag) #"-"))]
+                   :when (seq primary)]
+               [(str/lower-case primary) (or (parse-double (or q "1")) 0.0)])]
+    (or (some (set (keys files)) (map first (sort-by (comp - second) tags)))
+        "en")))
+
+(let [port (Integer/parseInt (or (first *command-line-args*) "8888"))]
+  (http/run-server
+    (fn [req]
+      (if (= "/" (:uri req))
+        (let [accept (get-in req [:headers "accept-language"])
+              lang   (negotiate accept)]
+          (println "serve:" (or accept "(no Accept-Language)") "→" lang)
+          {:status  200
+           :headers {"content-type"     "application/edn"
+                     "content-language" lang
+                     "vary"             "Accept-Language"}
+           :body    (slurp (files lang))})
+        {:status 404 :body "not found"}))
+    {:port port})
+  (println (str "the wire, negotiated, on http://localhost:" port " — en | fr"))
+  (Thread/sleep Long/MAX_VALUE))
+#+end_src
+
+The two representations are plain files beside this notebook — they are the
+/product/, edited live while the server runs, so they stay loose on purpose.
+=app_fr.edn=, for the record (=Zéro= also walks UTF-8 through the whole
+pipe: slurp → httpkit → NSData → =initWithData:encoding:= → =UILabel=):
+
+#+begin_src clojure :tangle no
+{:state {:count 0}
+ :view  [:vbox {:spacing 12 :margin 16}
+         [:label {:markup [:span {:size "small" :foreground "#8e939d"} "COMPTE, DEPUIS LE FIL"]}]
+         [:label {:markup [:span {:size "xx-large" :weight "bold"} [:state :count]]}]
+         [:hbox {:spacing 8 :homogeneous true}
+          [:button {:label "+ 1"  :actions [[:action/inc]]}]
+          [:button {:label "+ 3"  :actions [[:action/inc] [:action/inc] [:action/inc]]}]
+          [:button {:label "Zéro" :actions [[:action/reset]]}]
+          [:button {:label "- 1"  :actions [[:action/dec]]}]]
+         [:hbox {:spacing 8 :homogeneous true}
+          [:button {:label "English"  :actions [[:action/set-lang "en"]]}]
+          [:button {:label "Français" :actions [[:action/set-lang "fr"]]}]]]}
+#+end_src
+
+** =fetch= grows headers
+
+Explicit headers mean =NSMutableURLRequest= — =requestWithURL:=, then
+=setValue:forHTTPHeaderField:= per header, then
+=dataTaskWithRequest:completionHandler:= instead of the URL form. Without
+=:headers=, nothing is set and NSURLSession's own =Accept-Language= rides
+along: act one is the default. The block machinery is the previous
+section's, unchanged.
+
+#+begin_src clojure :tangle ../../src/demo/http.clj :mkdirp true :comments link
+(ns demo.http
+  "GET a URL through NSURLSession, optionally with headers. The completion
+  handler is an Objective-C BLOCK — a struct whose invoke slot is one
+  foreign-callable — delivered on the main queue, so fetch must be called
+  with the UIKit loop running (from :active, not before ui/run). Returns a
+  core.async channel that yields {:status n :body s} or {:error s}."
+  (:require [clojure.core.async :as async]
+            [glimmer-ios.ffi :as u]
+            [jolt.ffi :as ffi]))
+
+;; the objc_msgSend shapes glimmer-ios.ffi does not have
+(ffi/defcfn msg-2p      "objc_msgSend" [:pointer :pointer :pointer :pointer] :pointer)
+(ffi/defcfn msg-2pvoid  "objc_msgSend" [:pointer :pointer :pointer :pointer] :void)
+(ffi/defcfn msg-3p      "objc_msgSend" [:pointer :pointer :pointer :pointer :pointer] :pointer)
+(ffi/defcfn msg-1p1i64  "objc_msgSend" [:pointer :pointer :pointer :int64] :pointer)
+(ffi/defcfn c-dlopen    "dlopen" [:string :int] :pointer)
+(ffi/defcfn c-dlsym     "dlsym"  [:pointer :string] :pointer)
+
+(def ^:private BLOCK-IS-GLOBAL (bit-shift-left 1 28))
+(def ^:private NSUTF8StringEncoding 4)
+(def ^:private RTLD-NOW 2)
+
+;; --- the block (see "Dialing it in" for the ABI) -----------------------------
+(defonce ^:private pending (atom {}))          ; block address -> the fetch's channel
+
+(defn- deliver!
+  "The block's invoke: (block, NSData *, NSURLResponse *, NSError *). Runs on the
+  main thread, inside the run loop, while jolt is parked in UIApplicationMain."
+  [block data response error]
+  (when-let [ch (get @pending block)]
+    (swap! pending dissoc block)
+    (async/put! ch
+      (if (ffi/null? error)
+        {:status (u/objc-msg-send-0i64 response (u/sel "statusCode"))
+         :body   (when-not (ffi/null? data)
+                   (u/nsstring->str
+                     (msg-1p1i64 (u/objc-msg-send-0 (u/cls "NSString") (u/sel "alloc"))
+                                 (u/sel "initWithData:encoding:") data NSUTF8StringEncoding)))}
+        {:error (u/nsstring->str (u/objc-msg-send-0 error (u/sel "localizedDescription")))}))))
+
+(defonce ^:private invoke
+  (ffi/foreign-callable deliver! [:pointer :pointer :pointer :pointer] :void :collect-safe))
+
+;; delays: jolt build loads this namespace on the HOST, where none of this exists
+(defonce ^:private global-block-isa
+  (delay (c-dlsym (c-dlopen "/usr/lib/libSystem.B.dylib" RTLD-NOW) "_NSConcreteGlobalBlock")))
+
+(defonce ^:private descriptor
+  (delay (doto (ffi/alloc 16)
+           (ffi/write :uint64 0 0)
+           (ffi/write :uint64 8 32))))
+
+(defn- make-block
+  "A fresh global block around `invoke`. Never freed: the runtime reads its flags
+  on release, after invoke has returned — 32 bytes per fetch, on purpose."
+  []
+  (doto (ffi/alloc 32)
+    (ffi/write :pointer 0  @global-block-isa)
+    (ffi/write :int32   8  BLOCK-IS-GLOBAL)
+    (ffi/write :int32   12 0)
+    (ffi/write :pointer 16 invoke)
+    (ffi/write :pointer 24 @descriptor)))
+
+;; --- the session -------------------------------------------------------------
+(defonce ^:private session
+  (delay (let [s (msg-3p (u/cls "NSURLSession") (u/sel "sessionWithConfiguration:delegate:delegateQueue:")
+                         (u/objc-msg-send-0 (u/cls "NSURLSessionConfiguration") (u/sel "defaultSessionConfiguration"))
+                         ffi/null
+                         (u/objc-msg-send-0 (u/cls "NSOperationQueue") (u/sel "mainQueue")))]
+           (u/objc-msg-send-0 s (u/sel "retain")))))   ; autoreleased; we keep it for the process
+
+(defn fetch
+  "GET `url`. opts may carry {:headers {\"Accept-Language\" \"fr\"}}; without it
+  NSURLSession sends the device's own Accept-Language. Returns a channel that
+  yields {:status n :body s} or {:error s}. Call with the loop running."
+  [url & [{:keys [headers]}]]
+  (let [ch    (async/chan 1)
+        block (make-block)
+        req   (u/objc-msg-send-1p (u/cls "NSMutableURLRequest") (u/sel "requestWithURL:")
+                                  (u/objc-msg-send-1p (u/cls "NSURL") (u/sel "URLWithString:") (u/nsstring url)))]
+    (doseq [[k v] headers]
+      (msg-2pvoid req (u/sel "setValue:forHTTPHeaderField:") (u/nsstring v) (u/nsstring k)))
+    (let [task (msg-2p @session (u/sel "dataTaskWithRequest:completionHandler:") req block)]
+      (swap! pending assoc block ch)
+      (u/objc-msg-send-0void task (u/sel "resume"))
+      ch)))
+#+end_src
+
+** The shell learns the word
+
+=:action/set-lang= joins the vocabulary — spec'd like every other kind, so a
+view saying =[:action/set-lang :fr]= (a keyword, not a string) is refused at
+the door. Its interpretation: remember the language, refetch. =nil= means
+"never chosen": the fetch carries no explicit header and the device speaks
+for itself, so act one is what happens until someone taps.
+
+#+begin_src clojure :tangle ../../src/demo/app_wire.clj :mkdirp true :comments link
+(ns demo.app-wire
+  "demo.app plus the wire, negotiated: launch from Documents/app.edn (else the
+  bundled default), then on every :active — and every :action/set-lang — GET
+  wire-url and, if it validates, redraw from it. Offline, the cache stands.
+  NS=demo.app-wire jolt bundle."
+  (:require [clojure.core.async :as async]
+            [clojure.edn :as edn]
+            [clojure.spec.alpha :as s]
+            [demo.app :as app]
+            [demo.data :as d]
+            [demo.examples.counter :as counter]
+            [demo.http :as http]
+            [demo.registry :as reg]
+            [demo.repl :as repl]
+            [demo.store :as store]
+            [glimmer.core :as ui]
+            [glimmer-ios.core :as ios]))
+
+(def wire-url "http://Staton-Software-Mac-mini.local:8888/")   ; the Mac by its Bonjour name (scutil --get LocalHostName) — true from the simulator AND the phone, and ATS-exempt
+
+(defonce lang (atom nil))   ; nil = the device's own Accept-Language; \"fr\"/\"en\" = the user's choice
+
+(defn refresh!
+  "GET the app from the wire; a valid answer is installed and the ratoms
+  re-render. Anything else is printed and the cache stands."
+  []
+  (println "wire: fetching" wire-url "as" (or @lang "(device language)"))
+  (let [ch (http/fetch wire-url (when-let [l @lang] {:headers {"Accept-Language" l}}))]
+    (async/go
+      (let [{:keys [status body error]} (async/<! ch)]
+        (try
+          (cond error            (println "wire:" wire-url "—" error)
+                (not= 200 status) (println "wire:" wire-url "answered" status)
+                :else (let [a (d/validate! (edn/read-string body))]
+                        (swap! counter/state #(merge (:state a) %))
+                        (reset! app/current a)
+                        (println "wire: rendered" wire-url)))
+          (catch :default e (println "wire:" wire-url "rejected —" (ex-message e))))))))
+
+(defmethod reg/action-spec :action/set-lang [_]
+  (s/cat :kind #{:action/set-lang} :lang string?))
+(defmethod reg/run-action! :action/set-lang [_ [_ l]]
+  (reset! lang l)
+  (refresh!))
+
+(defn -main [& _]
+  (let [a (store/read-app)]
+    (reset! counter/state (:state a))
+    (reset! app/current a))
+  (ios/on-lifecycle! :background #(store/save! @app/current @counter/state))
+  (ios/on-lifecycle! :active refresh!)
+  (repl/start! repl/port :any)
+  (ui/run app/root :title "Counter (wire)"))
+#+end_src
+
+(This section first landed a hundred lines up, inside the wire section: its
+append anchored on the =-main= of the /superseded/ =demo.app-wire= block,
+which is character-for-character the =-main= of the live one. The price of
+keeping dead blocks around is that anchors need more context.)
+
+** Negotiated, proven
+
+The server first, from the Mac — q-values honored, headers correct:
+
+#+begin_example
+$ curl -sD- http://localhost:8888/ | grep -iE 'content-language|vary'
+Content-Language: en
+Vary: Accept-Language
+$ curl -s -H 'Accept-Language: fr-CA,fr;q=0.9,en;q=0.8' http://localhost:8888/ | sed -n 3p
+         [:label {:markup [:span … "COMPTE, DEPUIS LE FIL"]}]
+#+end_example
+
+Then both acts on the simulator, with the server's log as witness. The app
+launched (act one — nobody set a header), then =set-lang= was run through
+the registry over nREPL (act two), there and back:
+
+#+begin_example
+$ bb scripts/nrepl-eval 7888 '(demo.registry/execute-actions nil [[:action/set-lang "fr"]])'
+$ bb scripts/nrepl-eval 7888 '(get-in @demo.app/current [:view 2 1 :markup 2])'
+value "COMPTE, DEPUIS LE FIL"
+$ bb scripts/nrepl-eval 7888 '(demo.registry/execute-actions nil [[:action/set-lang "en"]])'
+value "COUNT, FROM THE WIRE"                                  (read back the same way)
+
+# the server's side of the same minute:
+serve: en-US,en;q=0.9 → en          ← act one: NSURLSession's own header, unprompted
+serve: fr → fr                      ← act two: the tap
+serve: en → en                      ← and the way back, from inside the French app
+#+end_example
+
+#+caption: The French representation — same URL, same shell, same vocabulary; only the header differed. =Zéro= is UTF-8 surviving slurp → httpkit → NSData → =initWithData:encoding:= → =UILabel=.
+[[file:../../media/wire-fr.png]]
+
+The first line of the log is act one exactly as promised: =en-US,en;q=0.9=
+was composed by NSURLSession from the device's own settings — and then the
+phone made the same point without being asked: its language switched to
+French in Settings, the app relaunched, and the server's log read
+=serve: fr-FR,fr;q=0.9 → fr= — the French app, first, from a device that
+had simply been told where its owner lives. No tap, no client code. And the
+last line of the simulator transcript is the sentence of the section: the
+way back to English arrived /inside the French data/.

@@ -1,12 +1,12 @@
 {:state {:count 0}
  :view  [:vbox {:spacing 12 :margin 16}
-         [:label {:markup [:span {:size "small" :foreground "#8e939d"} "COUNT, FROM THE WIRE"]}]
+         [:label {:markup [:span {:size "small" :foreground "#8e939d"} "COMPTE, DEPUIS LE FIL"]}]
          [:label {:markup [:span {:size "xx-large" :weight "bold"} [:state :count]]}]
          [:hbox {:spacing 8 :homogeneous true}
-          [:button {:label "+ 1"   :actions [[:action/inc]]}]
-          [:button {:label "+ 3"   :actions [[:action/inc] [:action/inc] [:action/inc]]}]
-          [:button {:label "Reset" :actions [[:action/reset]]}]
-          [:button {:label "- 1"   :actions [[:action/dec]]}]]
+          [:button {:label "+ 1"  :actions [[:action/inc]]}]
+          [:button {:label "+ 3"  :actions [[:action/inc] [:action/inc] [:action/inc]]}]
+          [:button {:label "Zéro" :actions [[:action/reset]]}]
+          [:button {:label "- 1"  :actions [[:action/dec]]}]]
          [:hbox {:spacing 8 :homogeneous true}
           [:button {:label "English"  :actions [[:action/set-lang "en"]]}]
           [:button {:label "Français" :actions [[:action/set-lang "fr"]]}]]]}
