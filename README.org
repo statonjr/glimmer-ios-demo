@@ -485,6 +485,8 @@ Generated files do not get that kind of edit:
 .vscode
 Brewfile.lock.json
 Hello.app
+# raw screen recordings; `jolt media` derives the committed mp4/gif from them
+media/*.mov
 #+end_src
 
 And the tangle itself is a =jolt= task, borrowed from the macOS demo, so the
@@ -500,11 +502,23 @@ once, from any Emacs.
 
 #+begin_src clojure :tangle deps.edn :comments link
 {:paths ["src"]
- :deps {}   ; milestone 0: glimmer-uikit's deps, minus what iOS cannot load
+ ;; Milestone 4: glimmer (the reactive core, no natives), hiccup (markup
+ ;; serialization), spec (the registry) — pins match glimmer-uikit's. No
+ ;; :jolt/native: UIKit is loaded from -main (see glimmer-ios/ffi.org).
+ :deps {jolt-lang/glimmer {:git/url "https://github.com/jolt-lang/glimmer"
+                           :git/tag "v0.1.0"
+                           :git/sha "5581c331c51aff989259b9e8e92ec920fe5e6741"}
+        weavejester/hiccup {:git/url "https://github.com/weavejester/hiccup"
+                            :git/sha "b6b12097ba973141fe87c1b4d6a27ddcce5d5929"}
+        ;; terminal under jolt (org.clojure/clojure contributes no children)
+        org.clojure/spec.alpha {:mvn/version "0.5.238"}}
+ :aliases {:test {:extra-paths ["test"] :main-opts ["-m" "glimmer-ios.test-runner"]}}
 
  ;; README.org is the source of truth; `jolt tangle` regenerates this file,
  ;; Brewfile and .gitignore from it. Never edit the tangled files directly.
- :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle </dev/null"
+ :tasks {;; every notebook, not just this one; never the deps checkout, the bundle, or docs/
+         tangle "find . -name '*.org' -not -path './.jolt/*' -not -path './Hello.app/*' -not -path './docs/*' | xargs -I{} emacs --batch -l package --eval '(package-initialize)' -l org {} -f org-babel-tangle"   ; no </dev/null here: xargs reads the file list from stdin
+         test   "jolt -M:test"
          ;; Milestone 1: cross-compile hello.core (or NS=screen.core) into the simulator bundle
          ;; (Info.plist is tangled), install it on the booted device, run it
          ;; with stdout attached. The pack is ~/dev/pack-tarm64ios-sim.
@@ -514,7 +528,11 @@ once, from any Emacs.
          ;; Plain launch: --console terminates the app when its session ends (milestone 3).
          launch  "xcrun simctl launch booted dev.statonsoftware.glimmer-ios.hello"
          ;; stdout of a running app, for as long as you keep the console open
-         console "xcrun simctl launch --console booted dev.statonsoftware.glimmer-ios.hello"}}
+         console "xcrun simctl launch --console booted dev.statonsoftware.glimmer-ios.hello"
+         ;; media/counter.mov (a macOS screen recording of the simulator) → the two
+         ;; shareable forms: H.264 mp4 for Slack/the web (faststart, 30 fps, 1080 tall),
+         ;; and a palette GIF for the README (GitHub inline-plays GIFs, not video files).
+         media   "ffmpeg -v error -y -i media/counter.mov -vf 'fps=30,scale=-2:1080' -c:v libx264 -profile:v high -pix_fmt yuv420p -crf 23 -preset slow -movflags +faststart -an media/counter.mp4 && ffmpeg -v error -y -i media/counter.mov -vf 'fps=12,scale=-2:720:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=5' media/counter.gif"}}
 #+end_src
 
 What Homebrew does /not/ replace is the =~/dev/ChezScheme= checkout: =make
@@ -1063,6 +1081,72 @@ Two more things the first screenshot taught:
   storyboard) in =Info.plist=, iOS runs the app in a compatibility layout
   sized for a much older phone. An empty =UILaunchScreen= dict is the whole
   fix, and it is in the plist above now.
+
+* Milestone 4: the counter (2026-08-31)
+
+The demonstration. Designed first — [[file:docs/specs/2026-08-31-milestone-4-counter.org][the spec]] records the choices and their
+reasons — then built as four notebooks, each the source of the namespaces it
+tangles:
+
+- [[file:glimmer-ios/ffi.org][glimmer-ios/ffi.org]] → =glimmer-ios.ffi= — the ObjC runtime and UIKit from
+  jolt; glimmer-uikit's bindings verbatim, four added, nothing at load time.
+- [[file:glimmer-ios/widget.org][glimmer-ios/widget.org]] → =glimmer-ios.widget= (+ the headless tests) —
+  hiccup to =UIStackView=/=UILabel=/=UIButton=; the Pango markup pipeline over
+  =UIFont=/=UIColor=; =GlimmerTarget= via =addTarget:action:forControlEvents:=.
+- [[file:glimmer-ios/core.org][glimmer-ios/core.org]] → =glimmer-ios.core= — the seam: =:run= from the
+  milestone-3 spike, the =swap-vals!= scheduler, the backend map.
+- [[file:examples/counter/README.org][examples/counter/README.org]] → =demo.registry=, =demo.examples.counter=,
+  =demo.smoke= — the macOS counter, its view unchanged, and the tap without a
+  finger.
+
+** The result
+
+#+caption: The macOS demo's counter view, character for character, on an iPhone 17 simulator.
+[[file:media/counter.png]]
+
+#+caption: Tapping it. (=media/counter.mp4= is the same recording for Slack and the web; =jolt media= derives both from the raw =.mov=.)
+[[file:media/counter.gif]]
+
+#+begin_example
+$ NS=demo.smoke jolt bundle && jolt install && jolt console
+smoke: posting from a worker thread
+smoke: tapped + 1 twice; state = {:count 2}
+#+end_example
+
+And the label read 2. That line is the whole round trip: a worker thread
+posts through =:schedule=, the CFRunLoopSource drains it on the main loop
+(the =swap-vals!= drain, exercised from off-thread as intended),
+=sendActionsForControlEvents:= reaches the =GlimmerTarget= IMP,
+=execute-actions= validates =[[:action/inc]]= against its spec and runs the
+multimethod, the ratom's =swap!= notifies glimmer, and the reconciler patches
+the =UILabel= in place. Host side: =jolt test= — 7 tests, 29 assertions —
+and =clj-kondo= at 0/0.
+
+Everything the research section worried about turned out to be either true
+and handled, or moot:
+
+- =UIStackView= ignores =layoutMargins= without =isLayoutMarginsRelativeArrangement=
+  — true; both calls are made, and =:margin 16= is visible.
+- the markup pipeline builds =NSFont=/=NSColor= — swapped for =UIFont=/=UIColor=
+  in two functions; the rest of the parser is glimmer-uikit's text.
+- =loop-running?= set after the mount — impossible here: it is set before
+  =UIApplicationMain=, so the delegate callback cannot run without it.
+- =os.name= / =errno= — nothing in this path reads either.
+
+** Three mistakes, kept
+
+- *=xargs= reads stdin.* The multi-notebook =tangle= task ended in =</dev/null=
+  — the hang-proofing from the =.gitignore= incident — which starved =xargs=
+  of the file list =find= was piping to it. Nothing tangled, silently
+  (=find: stdout: Broken pipe= was the only tell). With a pipe on stdin a
+  stray Emacs prompt hits EOF and errors, which was the goal all along; the
+  redirect is gone.
+- *A task that regenerates its own definition can't fix itself.* The broken
+  task lived in =deps.edn=, which the broken task was responsible for
+  regenerating. One direct =emacs --batch= on README.org broke the loop.
+- *=if-not= without an else.* glimmer-uikit's Pango validator, verbatim,
+  drew kondo's "Missing else branch"; it is =when-not= here, and 0/0 is
+  restored.
 
 * References
 

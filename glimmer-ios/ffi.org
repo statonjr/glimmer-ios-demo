@@ -1,0 +1,338 @@
+#+title: glimmer-ios.ffi — the Objective-C runtime and UIKit from jolt
+#+author: Larry Staton (with Claude)
+#+date: 31 August 2026
+
+Forked from [[https://github.com/jolt-lang/glimmer-uikit][glimmer-uikit]]'s =ffi.clj=. Everything about the ObjC runtime is
+verbatim — =objc_msgSend= bound per arity, the =sel=/=cls= caches, NSString
+marshalling, attributed strings, the CoreFoundation run-loop bindings. The
+AppKit helper section is replaced by a UIKit one, and three things are
+different on principle rather than by toolkit:
+
+- *Nothing loads at namespace load.* =jolt build= loads every namespace on the
+  host before emitting Scheme (milestone 3), and Linux CI has no ObjC runtime
+  at all. =load-uikit!= is called from the app loop; =kCFRunLoopDefaultMode= is
+  a =delay=. A =defcfn= is a Chez =foreign-procedure= and resolves lazily, so
+  the table below costs nothing until called.
+- *=BOOL= returns are =:uint8=.* jolt's =:char= is a Scheme character (milestone
+  3 found this the hard way); glimmer-uikit's =:char= returns are a latent bug.
+- *The arity table gains four bindings* the spec lists: =addTarget:action:forControlEvents:=
+  (=UIControlEvents= is =NSUInteger=), =systemFontOfSize:weight:= (returns a
+  pointer), =UIApplicationMain= (=:blocking=), and nothing else.
+
+#+begin_src clojure :tangle ../src/glimmer_ios/ffi.clj :mkdirp true :comments link
+(ns glimmer-ios.ffi
+  "Raw bindings for the Objective-C runtime and UIKit, built on jolt.ffi.
+
+  Objective-C from a C FFI: classes come from objc_getClass, selectors from
+  sel_registerName, and every method call goes through objc_msgSend bound at a
+  concrete arity. On Apple arm64 objc_msgSend is a dispatcher that forwards the
+  caller's registers to the method implementation, so a FIXED-arity binding
+  whose struct args are flattened into their component doubles matches the real
+  call layout (a CGRect or UIEdgeInsets is an HFA of 4 doubles -> d0-d3). Never
+  bind it with :varargs — the variadic convention passes FP args on the stack.
+
+  UIKit is dlopen'd by load-uikit!, which the app loop calls from -main: never at
+  namespace load, because jolt build loads this namespace on the macOS host
+  first, and the headless tests run where there is no ObjC runtime at all.
+
+  Marshalling: a C string crosses the FFI as :string (UTF-8); NSStrings are
+  created with stringWithUTF8String: and read back with UTF8String. BOOL args
+  are :int, BOOL returns :uint8 (jolt's :char is a Scheme character),
+  NSInteger/NSUInteger :int64, CGFloat :double, UILayoutPriority :float."
+  (:require [jolt.ffi :as ffi]))
+
+;; --- loading UIKit (from -main, never at load) ------------------------------
+(defonce ^:private uikit-loaded? (atom false))
+
+(defn load-uikit!
+  "dlopen UIKit so objc_getClass finds its classes. Idempotent. Only meaningful
+  inside the simulator/device process; on the host it throws, which is the
+  point — nothing calls it there."
+  []
+  (when-not @uikit-loaded?
+    (ffi/load-library "/System/Library/Frameworks/UIKit.framework/UIKit")
+    (reset! uikit-loaded? true))
+  nil)
+
+;; --- constants ---------------------------------------------------------------
+;; UILayoutConstraintAxis
+(def AXIS-HORIZONTAL 0)
+(def AXIS-VERTICAL 1)
+;; UIStackViewDistribution
+(def DISTRIBUTION-FILL 0)
+(def DISTRIBUTION-FILL-EQUALLY 1)
+;; UIStackViewAlignment (leading == top, trailing == bottom)
+(def ALIGN-FILL 0) (def ALIGN-LEADING 1) (def ALIGN-CENTER 3) (def ALIGN-TRAILING 4)
+;; NSLayoutAttribute (same numbering as AppKit)
+(def ATTR-LEFT 1)  (def ATTR-RIGHT 2)  (def ATTR-TOP 3) (def ATTR-BOTTOM 4)
+(def ATTR-LEADING 5) (def ATTR-TRAILING 6)
+(def ATTR-WIDTH 7) (def ATTR-HEIGHT 8)
+(def ATTR-CENTER-X 9) (def ATTR-CENTER-Y 10)
+(def RELATION-EQUAL 0)
+;; NSTextAlignment
+(def TEXT-ALIGN-LEFT 0) (def TEXT-ALIGN-CENTER 1) (def TEXT-ALIGN-RIGHT 2)
+;; NSLineBreakMode
+(def LINE-BREAK-WRAP 0) (def LINE-BREAK-CLIP 2)
+(def LINE-BREAK-HEAD 3) (def LINE-BREAK-TAIL 4) (def LINE-BREAK-MIDDLE 5)
+;; UILayoutPriority (a float)
+(def PRIORITY-REQUIRED 1000)
+(def PRIORITY-LOW 250)
+(def PRIORITY-VERY-LOW 1)
+;; UIButtonType / UIControlState / UIControlEvents
+(def BUTTON-SYSTEM 1)
+(def CONTROL-STATE-NORMAL 0)
+(def EVENT-TOUCH-UP-INSIDE 64)                 ; 1 << 6
+;; UIFontWeight (a CGFloat)
+(def FONT-WEIGHT-REGULAR 0.0)
+(def FONT-WEIGHT-BOLD 0.4)
+;; NSAttributedString attribute keys — the constants ARE these strings, on iOS too
+(def NS-FONT-ATTR "NSFont")
+(def NS-FOREGROUND-COLOR-ATTR "NSColor")
+(def NS-STRIKETHROUGH-ATTR "NSStrikethrough")
+(def NS-UNDERLINE-ATTR "NSUnderline")
+
+;; --- ObjC runtime ------------------------------------------------------------
+;; objc_msgSend bound at the arities the backend needs. Each is a distinct
+;; foreign-procedure over the same symbol; the dispatcher forwards registers
+;; verbatim, so the typed shape only has to match the method's calling
+;; convention, not its declared prototype.
+(ffi/defcfn objc-msg-send-0        "objc_msgSend" [:pointer :pointer] :pointer)
+(ffi/defcfn objc-msg-send-0void    "objc_msgSend" [:pointer :pointer] :void)
+(ffi/defcfn objc-msg-send-0i64     "objc_msgSend" [:pointer :pointer] :int64)
+(ffi/defcfn objc-msg-send-0cstr    "objc_msgSend" [:pointer :pointer] :string)
+(ffi/defcfn objc-msg-send-1p       "objc_msgSend" [:pointer :pointer :pointer] :pointer)
+(ffi/defcfn objc-msg-send-1pvoid   "objc_msgSend" [:pointer :pointer :pointer] :void)
+(ffi/defcfn objc-msg-send-1s       "objc_msgSend" [:pointer :pointer :string] :pointer)
+(ffi/defcfn objc-msg-send-1d       "objc_msgSend" [:pointer :pointer :double] :pointer)
+(ffi/defcfn objc-msg-send-1dvoid   "objc_msgSend" [:pointer :pointer :double] :void)
+(ffi/defcfn objc-msg-send-1i64     "objc_msgSend" [:pointer :pointer :int64] :pointer)
+(ffi/defcfn objc-msg-send-1i64void "objc_msgSend" [:pointer :pointer :int64] :void)
+;; BOOL args are :int — jolt's :char is a Scheme CHARACTER, not an 8-bit int.
+(ffi/defcfn objc-msg-send-1intvoid "objc_msgSend" [:pointer :pointer :int] :void)
+;; setContentHuggingPriority:forAxis: — UILayoutPriority is a FLOAT
+(ffi/defcfn objc-msg-send-1f1i64void "objc_msgSend" [:pointer :pointer :float :int64] :void)
+;; systemFontOfSize:weight: — (CGFloat, UIFontWeight) -> UIFont*
+(ffi/defcfn objc-msg-send-2d       "objc_msgSend" [:pointer :pointer :double :double] :pointer)
+(ffi/defcfn objc-msg-send-4d       "objc_msgSend" [:pointer :pointer :double :double :double :double] :pointer)
+;; setLayoutMargins: (UIEdgeInsets top left bottom right, an HFA of 4 doubles)
+(ffi/defcfn objc-msg-send-4dvoid   "objc_msgSend" [:pointer :pointer :double :double :double :double] :void)
+;; setTitle:forState: / insertArrangedSubview:atIndex:
+(ffi/defcfn objc-msg-send-1p1i64void "objc_msgSend" [:pointer :pointer :pointer :int64] :void)
+;; addTarget:action:forControlEvents: — (id target, SEL action, UIControlEvents)
+(ffi/defcfn objc-msg-send-2p1i64void "objc_msgSend" [:pointer :pointer :pointer :pointer :int64] :void)
+;; (id, SEL, id) -> NSInteger (indexOfObject:)
+(ffi/defcfn objc-msg-send-1p-i64ret "objc_msgSend" [:pointer :pointer :pointer] :int64)
+;; addAttribute:value:range: — (id key, id value, NSUInteger loc, NSUInteger len)
+(ffi/defcfn objc-msg-send-2p2i64void "objc_msgSend" [:pointer :pointer :pointer :pointer :int64 :int64] :void)
+;; constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:
+(ffi/defcfn objc-msg-send-constraint
+  "objc_msgSend" [:pointer :pointer :pointer :int64 :int64 :pointer :int64 :double :double] :pointer)
+
+(ffi/defcfn objc-get-class           "objc_getClass"           [:string] :pointer)
+(ffi/defcfn sel-register-name        "sel_registerName"        [:string] :pointer)
+(ffi/defcfn objc-allocate-class-pair "objc_allocateClassPair"  [:pointer :string :size_t] :pointer)
+(ffi/defcfn objc-register-class-pair "objc_registerClassPair"  [:pointer] :void)
+(ffi/defcfn class-add-method         "class_addMethod"         [:pointer :pointer :pointer :string] :uint8)
+
+;; int UIApplicationMain(int argc, char *argv[], NSString *principal, NSString *delegate)
+;; Never returns; :blocking so the parked jolt thread does not pin the collector.
+(ffi/defcfn ui-application-main "UIApplicationMain" [:int :pointer :pointer :pointer] :int :blocking)
+
+;; --- CFRunLoop (scheduling onto the main loop, pure C — no blocks needed) ----
+(ffi/defcfn cf-run-loop-get-main      "CFRunLoopGetMain"      [] :pointer)
+(ffi/defcfn cf-run-loop-source-create "CFRunLoopSourceCreate" [:pointer :int64 :pointer] :pointer)
+(ffi/defcfn cf-run-loop-add-source    "CFRunLoopAddSource"    [:pointer :pointer :pointer] :void)
+(ffi/defcfn cf-run-loop-source-signal "CFRunLoopSourceSignal" [:pointer] :void)
+(ffi/defcfn cf-run-loop-wake-up       "CFRunLoopWakeUp"       [:pointer] :void)
+;; CFRunLoopAddSource hashes the mode string and does NOT accept NULL. Create the
+;; default-mode string once (kCFRunLoopCommonModes must NOT be reproduced this
+;; way — CF recognizes that one by identity). UIApplicationMain runs the main
+;; loop in the default mode.
+(ffi/defcfn cf-string-create-with-cstring
+  "CFStringCreateWithCString" [:pointer :string :int64] :pointer)
+
+(def ^:private kCFRunLoopDefaultMode
+  ;; a delay, not a def: nothing calls CoreFoundation at namespace load
+  (delay (cf-string-create-with-cstring ffi/null "kCFRunLoopDefaultMode" 134217984))) ; kCFStringEncodingUTF8
+
+(defn default-mode
+  "The CFString naming the run loop's default mode (retained by the loop)."
+  [] @kCFRunLoopDefaultMode)
+
+;; --- selector / class caches -------------------------------------------------
+(def ^:private sel-cache (atom {}))
+(defn sel
+  "Register (once) and return the selector for a method name."
+  [name]
+  (or (get @sel-cache name)
+      (let [s (sel-register-name name)]
+        (swap! sel-cache assoc name s)
+        s)))
+
+(def ^:private class-cache (atom {}))
+(defn cls
+  "Look up (once) and return the ObjC class for a name."
+  [name]
+  (or (get @class-cache name)
+      (let [c (objc-get-class name)]
+        (swap! class-cache assoc name c)
+        c)))
+
+(defn new-obj
+  "[[Class alloc] init]."
+  [class-name]
+  (objc-msg-send-0 (objc-msg-send-0 (cls class-name) (sel "alloc")) (sel "init")))
+
+;; --- strings ----------------------------------------------------------------
+(defn nsstring
+  "Create an NSString (autoreleased) from a jolt string."
+  [s]
+  (objc-msg-send-1s (cls "NSString") (sel "stringWithUTF8String:") s))
+
+(defn nsstring->str
+  "Read an NSString as a jolt string, or nil when the pointer is null."
+  [s]
+  (when-not (ffi/null? s)
+    (objc-msg-send-0cstr s (sel "UTF8String"))))
+
+(defn number-int
+  "An NSNumber wrapping an integer (for attributed-string attribute values)."
+  [n]
+  (objc-msg-send-1i64 (cls "NSNumber") (sel "numberWithInt:") n))
+
+;; --- UIApplication / UIWindow / UIViewController -----------------------------
+(defn run-application!
+  "UIApplicationMain with a delegate CLASS NAME. Blocks for the life of the
+  process; UIKit instantiates the delegate itself."
+  [delegate-class-name]
+  (ffi/with-c-string-array [argv 1] ["glimmer"]
+    (ui-application-main 1 argv ffi/null (nsstring delegate-class-name))))
+(defn window-new
+  "[[UIWindow alloc] init] — since iOS 13, sized to the main screen."
+  [] (new-obj "UIWindow"))
+(defn window-root-controller! [w vc] (objc-msg-send-1pvoid w (sel "setRootViewController:") vc))
+(defn window-make-key! [w] (objc-msg-send-0void w (sel "makeKeyAndVisible")))
+(defn view-controller-new [] (new-obj "UIViewController"))
+(defn controller-view [vc] (objc-msg-send-0 vc (sel "view")))
+
+;; --- UIView layout ----------------------------------------------------------
+(defn add-subview! [parent child] (objc-msg-send-1pvoid parent (sel "addSubview:") child))
+(defn remove-from-superview! [v] (objc-msg-send-0void v (sel "removeFromSuperview")))
+(defn set-translates-autoresizing! [v b]
+  (objc-msg-send-1intvoid v (sel "setTranslatesAutoresizingMaskIntoConstraints:") (if b 1 0)))
+(defn set-hidden! [v b] (objc-msg-send-1intvoid v (sel "setHidden:") (if b 1 0)))
+(defn set-background! [v color] (objc-msg-send-1pvoid v (sel "setBackgroundColor:") color))
+(defn set-hugging! [v priority axis]
+  ;; UILayoutPriority is a FLOAT (32-bit), not CGFloat.
+  (objc-msg-send-1f1i64void v (sel "setContentHuggingPriority:forAxis:") (float priority) axis))
+(defn safe-area-guide [v] (objc-msg-send-0 v (sel "safeAreaLayoutGuide")))
+(defn constraint [item1 attr1 item2 attr2 multiplier constant]
+  (objc-msg-send-constraint
+    (cls "NSLayoutConstraint")
+    (sel "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:")
+    item1 attr1 RELATION-EQUAL item2 attr2 (double multiplier) (double constant)))
+(defn activate! [c] (objc-msg-send-1intvoid c (sel "setActive:") 1))
+(defn pin-to-safe-area!
+  "Pin `child`'s top/leading/trailing to `parent`'s safe-area layout guide. The
+  bottom is left free: a stack hugs its content."
+  [child parent]
+  (set-translates-autoresizing! child false)
+  (let [guide (safe-area-guide parent)]
+    (doseq [a [ATTR-TOP ATTR-LEADING ATTR-TRAILING]]
+      (activate! (constraint child a guide a 1.0 0.0)))))
+
+;; --- UIStackView ------------------------------------------------------------
+(defn stack-new
+  "An empty UIStackView (alloc/init — there is no stackViewWithViews: on iOS)."
+  [] (new-obj "UIStackView"))
+(defn stack-axis [s] (objc-msg-send-0i64 s (sel "axis")))
+(defn stack-axis! [s a] (objc-msg-send-1i64void s (sel "setAxis:") a))
+(defn stack-spacing! [s d] (objc-msg-send-1dvoid s (sel "setSpacing:") (double d)))
+(defn stack-alignment! [s a] (objc-msg-send-1i64void s (sel "setAlignment:") a))
+(defn stack-distribution! [s d] (objc-msg-send-1i64void s (sel "setDistribution:") d))
+(defn stack-layout-margins!
+  "Edge insets — and the flag without which UIStackView ignores them."
+  [s top left bottom right]
+  (objc-msg-send-4dvoid s (sel "setLayoutMargins:")
+                        (double (or top 0)) (double (or left 0))
+                        (double (or bottom 0)) (double (or right 0)))
+  (objc-msg-send-1intvoid s (sel "setLayoutMarginsRelativeArrangement:") 1))
+(defn stack-add-arranged! [s v] (objc-msg-send-1pvoid s (sel "addArrangedSubview:") v))
+(defn stack-remove-arranged! [s v] (objc-msg-send-1pvoid s (sel "removeArrangedSubview:") v))
+(defn stack-insert-arranged! [s v i] (objc-msg-send-1p1i64void s (sel "insertArrangedSubview:atIndex:") v i))
+(defn stack-index-of!
+  "The arranged index of `v` (ask the arrangedSubviews array)."
+  [s v]
+  (objc-msg-send-1p-i64ret (objc-msg-send-0 s (sel "arrangedSubviews")) (sel "indexOfObject:") v))
+(defn stack-arranged! [s] (objc-msg-send-0 s (sel "arrangedSubviews")))
+
+;; --- NSArray ----------------------------------------------------------------
+(defn array-count [a] (objc-msg-send-0i64 a (sel "count")))
+(defn array-get [a i] (objc-msg-send-1i64 a (sel "objectAtIndex:") i))
+
+;; --- UILabel ----------------------------------------------------------------
+(defn label-text! [l s] (objc-msg-send-1pvoid l (sel "setText:") (nsstring s)))
+(defn label-text [l] (nsstring->str (objc-msg-send-0 l (sel "text"))))
+(defn label-new
+  "A UILabel with initial text."
+  [s]
+  (let [l (new-obj "UILabel")]
+    (label-text! l s)
+    l))
+(defn label-attributed! [l a] (objc-msg-send-1pvoid l (sel "setAttributedText:") a))
+(defn label-align! [l a] (objc-msg-send-1i64void l (sel "setTextAlignment:") a))
+(defn label-lines! [l n] (objc-msg-send-1i64void l (sel "setNumberOfLines:") n))
+(defn label-line-break! [l m] (objc-msg-send-1i64void l (sel "setLineBreakMode:") m))
+
+;; --- UIButton / UIControl ---------------------------------------------------
+(defn button-title! [b s]
+  (objc-msg-send-1p1i64void b (sel "setTitle:forState:") (nsstring s) CONTROL-STATE-NORMAL))
+(defn button-new
+  "A system-style button with a title (target/action wired later)."
+  [title]
+  (let [b (objc-msg-send-1i64 (cls "UIButton") (sel "buttonWithType:") BUTTON-SYSTEM)]
+    (button-title! b title)
+    b))
+(defn control-enabled! [c b] (objc-msg-send-1intvoid c (sel "setEnabled:") (if b 1 0)))
+(defn add-target!
+  "addTarget:action:forControlEvents: — `events` is a UIControlEvents mask."
+  [c target selector events]
+  (objc-msg-send-2p1i64void c (sel "addTarget:action:forControlEvents:") target selector events))
+(defn send-actions!
+  "Fire the control's actions for `events` programmatically (smoke tests)."
+  [c events]
+  (objc-msg-send-1i64void c (sel "sendActionsForControlEvents:") events))
+
+;; --- fonts / colors / attributed strings ------------------------------------
+(defn system-font [size weight]
+  (objc-msg-send-2d (cls "UIFont") (sel "systemFontOfSize:weight:") (double size) (double weight)))
+(defn italic-font-size [size] (objc-msg-send-1d (cls "UIFont") (sel "italicSystemFontOfSize:") (double size)))
+(defn system-background-color [] (objc-msg-send-0 (cls "UIColor") (sel "systemBackgroundColor")))
+(defn- hex-digit [c]
+  (let [n (int c)]
+    (cond (<= 48 n 57) (- n 48)
+          (<= 97 n 102) (- n 87)
+          (<= 65 n 70) (- n 55)
+          :else (throw (ex-info (str "glimmer-ios: bad hex digit " c) {})))))
+(defn- hex->int [s] (reduce (fn [acc c] (+ (* acc 16) (hex-digit c))) 0 s))
+(defn color-hex
+  "Parse \"#rrggbb\" (or \"#rgb\") into a UIColor."
+  [hex]
+  (let [h (subs hex 1)
+        h (if (= 3 (count h)) (apply str (mapcat (fn [c] [c c]) h)) h)]
+    (objc-msg-send-4d (cls "UIColor") (sel "colorWithRed:green:blue:alpha:")
+                      (/ (hex->int (subs h 0 2)) 255.0)
+                      (/ (hex->int (subs h 2 4)) 255.0)
+                      (/ (hex->int (subs h 4 6)) 255.0)
+                      1.0)))
+(defn attributed-new
+  "An NSMutableAttributedString over a plain string."
+  [s]
+  (objc-msg-send-1p (objc-msg-send-0 (cls "NSMutableAttributedString") (sel "alloc"))
+                    (sel "initWithString:") (nsstring s)))
+(defn attributed-add!
+  "Add an attribute over [start, start+len)."
+  [a key value start len]
+  (objc-msg-send-2p2i64void a (sel "addAttribute:value:range:") (nsstring key) value start len))
+(defn attributed-length [a] (objc-msg-send-0i64 a (sel "length")))
+#+end_src

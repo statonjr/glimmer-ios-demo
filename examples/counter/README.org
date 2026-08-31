@@ -1,0 +1,157 @@
+#+title: The counter, on iOS
+#+author: Larry Staton (with Claude)
+#+date: 31 August 2026
+
+The demonstration the notebook exists for: the macOS demo's counter, its
+view unchanged, running on the simulator over the glimmer seam. Two
+namespaces from [[https://github.com/statonjr/glitter-uikit-demo][glitter-uikit-demo]] come across — the registry, trimmed to
+its action pipeline, and the counter — plus a smoke that taps the button
+without a finger.
+
+* The registry, trimmed
+
+The macOS =demo.registry= had two halves: an /example registry/ (a hub window
+that opens examples) and an /action pipeline/ (actions as data, one spec per
+kind, one multimethod per kind). One screen needs no hub, so only the
+pipeline comes across — and =event-value= and =core/set-dispatch!= go with the
+hub, since they were the shape of glitter's event map. Under glimmer a button
+delivers nothing but the click, so =execute-actions= is called directly.
+
+#+begin_src clojure :tangle ../../src/demo/registry.clj :mkdirp true :comments link
+(ns demo.registry
+  "The open action pipeline: actions are data ([:action/inc]), each kind
+  declares its spec and its interpretation, and execute-actions validates then
+  runs a vector of them. Example namespaces require this — never demo.core."
+  (:require [clojure.spec.alpha :as s]))
+
+(defmulti action-spec
+  "Spec for one action vector, dispatched on its kind. Each notebook
+  defmethods its own kinds; no method means invalid — typos stay loud."
+  first)
+
+(s/def ::action (s/multi-spec action-spec (fn [g _] g)))
+(s/def ::actions (s/coll-of ::action))
+
+(defmulti run-action!
+  "Interpret one action vector. `event` is whatever the caller passes (nil
+  from a button — UIKit hands a click no payload)."
+  (fn [_event action] (first action)))
+
+(defmethod run-action! :default [_ action]
+  (println "Unhandled action:" (pr-str action)))
+
+(defn execute-actions
+  "Validate `actions` against ::actions, then run each in order."
+  [event actions]
+  (when-not (s/valid? ::actions actions)
+    (println "Invalid actions:" (s/explain-str ::actions actions)))
+  (doseq [a actions] (run-action! event a)))
+#+end_src
+
+* The counter — the diff worth printing
+
+Against =examples/counter/README.org= in the macOS demo:
+
+- the =ns= requires: =glimmer.ratom=, =glimmer.core= and =glimmer-ios.core=
+  (for its install side effect) join =demo.registry= and =spec.alpha= — "unchanged
+  except the requires", as the introduction promised;
+- =state= is a ratom (=r/atom=), so a deref during render subscribes the
+  component and a =swap!= re-renders it. =swap!= itself is unchanged:
+  =glimmer.ratom= rebinds =clojure.core/swap!= to dispatch on reactive cells;
+- three lines in the view: =:on {:click [[…]]}= becomes
+  =:on-click #(reg/execute-actions nil [[…]])=;
+- =register-example!= becomes a =-main=, and a one-line =root= derefs the state.
+
+The view is otherwise the macOS text, character for character, =:markup=,
+=:homogeneous= and =:margin= included. The six =defmethod=​s are untouched.
+
+#+begin_src clojure :tangle ../../src/demo/examples/counter.clj :mkdirp true :comments link
+(ns demo.examples.counter
+  (:require [clojure.spec.alpha :as s]
+            [demo.registry :as reg]
+            [glimmer.ratom :as r]
+            [glimmer.core :as ui]
+            [glimmer-ios.core]))          ; installs the UIKit backend
+
+(defonce state (r/atom {:count 0}))
+
+(defn view [{:keys [count]}]
+  [:vbox {:spacing 12 :margin 16}
+   [:label {:markup [:span {:size "small" :foreground "#8e939d"} "COUNT"]}]
+   [:label {:markup [:span {:size "xx-large" :weight "bold"} (str count)]}]
+   [:hbox {:spacing 8 :homogeneous true}
+    [:button {:label "+ 1"   :on-click #(reg/execute-actions nil [[:action/inc]])}]
+    [:button {:label "Reset" :on-click #(reg/execute-actions nil [[:action/reset]])}]
+    [:button {:label "- 1"   :on-click #(reg/execute-actions nil [[:action/dec]])}]]])
+
+(defmethod reg/action-spec :action/inc [_] (s/cat :kind #{:action/inc}))
+(defmethod reg/action-spec :action/dec [_] (s/cat :kind #{:action/dec}))
+(defmethod reg/action-spec :action/reset [_] (s/cat :kind #{:action/reset}))
+
+(defmethod reg/run-action! :action/inc [_ _] (swap! state update :count inc))
+(defmethod reg/run-action! :action/dec [_ _] (swap! state update :count dec))
+(defmethod reg/run-action! :action/reset [_ _] (swap! state assoc :count 0))
+
+(defn root
+  "The reactive root: derefs the state so glimmer re-renders it on change."
+  []
+  (view @state))
+
+(defn -main [& _]
+  (ui/run root :title "Counter"))
+#+end_src
+
+Run it:
+
+#+begin_example
+NS=demo.examples.counter jolt bundle && jolt install && jolt launch
+#+end_example
+
+* The smoke: a tap without a finger
+
+=simctl= cannot tap. What it can do is run the app and show its stdout, so
+the smoke does the tap from inside: a =future= sleeps a second, then posts —
+through the backend's own =:schedule=, from a thread that is not the main
+loop, which is the case the =swap-vals!= drain exists for — a thunk that walks
+glimmer's instance tree to the =+ 1= button, fires
+=sendActionsForControlEvents:= on it twice, and prints the state. The =future=
+starts before =ui/run=, which never returns. Expected: ={:count 2}=.
+
+The instance tree is glimmer's: a =:comp= node with one child, =:native= nodes
+with a =:widget= pointer and a vector of child atoms.
+
+#+begin_src clojure :tangle ../../src/demo/smoke.clj :mkdirp true :comments link
+(ns demo.smoke
+  "Runs the counter and taps + 1 twice from a worker thread, via :schedule."
+  (:require [demo.examples.counter :as counter]
+            [glimmer.core :as ui]
+            [glimmer-ios.core :as ios]
+            [glimmer-ios.ffi :as u]))
+
+(defn- find-native
+  "Depth-first search of glimmer's instance tree for a :native node matching pred."
+  [inst-atom pred]
+  (let [inst @inst-atom]
+    (if (and (= :native (:type inst)) (pred inst))
+      inst
+      (some #(find-native % pred) (:children inst)))))
+
+(defn- tap-plus-one-twice! []
+  (if-let [btn (find-native (ios/root-inst)
+                            #(and (= :button (:tag %)) (= "+ 1" (:label (:props %)))))]
+    (do (u/send-actions! (:widget btn) u/EVENT-TOUCH-UP-INSIDE)
+        (u/send-actions! (:widget btn) u/EVENT-TOUCH-UP-INSIDE)
+        (println "smoke: tapped + 1 twice; state =" (pr-str @counter/state)))
+    (println "smoke: no + 1 button found in the instance tree")))
+
+(defn -main [& _]
+  (future
+    (Thread/sleep 1000)
+    (println "smoke: posting from a worker thread")
+    (ios/schedule! tap-plus-one-twice!))
+  (ui/run counter/root :title "Counter smoke"))
+#+end_src
+
+#+begin_example
+NS=demo.smoke jolt bundle && jolt install && jolt console
+#+end_example
