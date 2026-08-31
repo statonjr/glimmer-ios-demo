@@ -553,6 +553,8 @@ once, from any Emacs.
          ;; iOS suspends a backgrounded app and its listener refuses; this brings it back
          ;; to the foreground (works over Wi-Fi — no cable) so `jolt connect` answers again
          wake    "xcrun devicectl device process launch --terminate-existing --device ${DEVICE:?set DEVICE to the phone UDID} dev.statonsoftware.glimmer-ios.hello"
+         ;; what TARGET=sim and TARGET=device would talk to: booted simulators, paired phones
+         devices "echo '# simulators (booted)'; xcrun simctl list devices booted | grep -E 'Booted'; echo '# devices (paired; export DEVICE=<udid>)'; xcrun devicectl list devices 2>/dev/null | tail -n +3"
          ;; nREPL's own JVM client, for comparison or when a fuller client is wanted (1.4 s+)
          connect-clj "clj -Sdeps '{:deps {nrepl/nrepl {:mvn/version \"1.3.1\"}}}' -M -m nrepl.cmdline --connect --host ${HOST:-127.0.0.1} --port ${PORT:-7889}"
          ;; not `run`: that is a jolt subcommand, and it wins over a task of the same name.
@@ -807,7 +809,7 @@ plist is tangled, the binary is built, nothing in it is source.
   <key>CFBundleIdentifier</key>        <string>dev.statonsoftware.glimmer-ios.hello</string>
   <key>CFBundleExecutable</key>        <string>Hello</string>
   <key>CFBundleName</key>              <string>Hello</string>
-  <key>CFBundleDisplayName</key>       <string>Hello</string>
+  <key>CFBundleDisplayName</key>       <string>Counter</string>   <!-- the tile's label; the bundle stays Hello.app -->
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleVersion</key>           <string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
@@ -1253,6 +1255,8 @@ JOLT_TARGET_ARCH_FLAG="$ARCH" \
 JOLT_TARGET_LINK_LIBS="-L$PACK/lib -llz4 -lz $EXTRA -framework Foundation -liconv -lm" \
   jolt build -m "$NS" -o Hello.app/Hello --target "$MACHINE" --target-pack "$PACK"
 rm -rf Hello.app/Hello.build
+# a previous `jolt device` leaves its signature and profile behind; a fresh build is unsigned
+rm -rf Hello.app/_CodeSignature Hello.app/embedded.mobileprovision
 sh scripts/icon
 #+end_src
 ** Minting a signature without an Xcode project
@@ -1509,6 +1513,27 @@ magick "$T/1024.png" -resize 180x180 Hello.app/AppIcon60x60@3x.png
 magick "$T/1024.png" -resize 120x120 Hello.app/AppIcon60x60@2x.png
 rm -rf "$T"
 #+end_src
+
+* Upstream
+
+Findings that belong to other repositories, written to be pasted into
+#jolt or an issue. Each has a concrete casualty in this notebook.
+
+- *jolt: =os.name= and =os.arch= on iOS machine types* — =sys-os-name=
+  classifies =*osx= as macOS and everything else as Linux, so =tarm64ios= and
+  =tpb64l= report "Linux"; =os.arch= reports the machine type ("tpb64l").
+  Casualties: =jolt.ffi='s =errno-loc= resolves =__errno_location=, which
+  Darwin lacks; =jolt.nrepl= picks Linux socket constants (=SOCK_CLOEXEC=,
+  a =sockaddr_in= without =sin_len=) and =socket()= returns EINVAL — this
+  notebook had to own its listener. Proposed: =sa-os-family= treats =*ios=
+  as Darwin; =os.name= "iOS"; =os.arch= "aarch64" regardless of backend.
+- *jolt: =make-pack.sh= and =pb= packs* — a =pb= kernel built
+  =--enable-libffi= needs =libffi.a= in the pack and =-lffi= in =link-libs=;
+  the script knows neither. The iOS recipe copies it in by hand.
+- *glimmer-uikit: two small bugs* — =terminate-cb= returns =1= as =:char=,
+  which jolt maps to a Scheme character ("invalid return value 1"); a =BOOL=
+  is =:uint8=. And the scheduler's deref-then-=reset!= drain can lose a
+  concurrent post; =swap-vals!= is the CAS form (glitter-uikit's P3.T2).
 
 * TODO
 
