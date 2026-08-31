@@ -484,6 +484,7 @@ Generated files do not get that kind of edit:
 .lsp
 .vscode
 Brewfile.lock.json
+Hello.app
 #+end_src
 
 And the tangle itself is a =jolt= task, borrowed from the macOS demo, so the
@@ -498,11 +499,19 @@ the block above says =conf=, whose comment is =#=) leaves Emacs waiting on a
 once, from any Emacs.
 
 #+begin_src clojure :tangle deps.edn :comments link
-{:deps {}   ; milestone 0: glimmer-uikit's deps, minus what iOS cannot load
+{:paths ["src"]
+ :deps {}   ; milestone 0: glimmer-uikit's deps, minus what iOS cannot load
 
  ;; README.org is the source of truth; `jolt tangle` regenerates this file,
  ;; Brewfile and .gitignore from it. Never edit the tangled files directly.
- :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle </dev/null"}}
+ :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle </dev/null"
+         ;; Milestone 1: cross-compile hello.core into the simulator bundle
+         ;; (Info.plist is tangled), install it on the booted device, run it
+         ;; with stdout attached. The pack is ~/dev/pack-tarm64ios-sim.
+         bundle  "PACK=$HOME/dev/pack-tarm64ios-sim; SDK=$(xcrun -sdk iphonesimulator --show-sdk-path); mkdir -p Hello.app && JOLT_TARGET_CC=clang JOLT_TARGET_ARCH_FLAG=\"-target arm64-apple-ios-simulator -isysroot $SDK\" JOLT_TARGET_LINK_LIBS=\"-L$PACK/lib -llz4 -lz -framework Foundation -liconv -lm\" jolt build -m hello.core -o Hello.app/Hello --target tarm64ios --target-pack $PACK && rm -rf Hello.app/Hello.build"
+         install "xcrun simctl install booted Hello.app"
+         ;; not `run`: that is a jolt subcommand, and it wins over a task of the same name
+         launch  "xcrun simctl launch --console booted dev.statonsoftware.glimmer-ios.hello"}}
 #+end_src
 
 What Homebrew does /not/ replace is the =~/dev/ChezScheme= checkout: =make
@@ -583,6 +592,249 @@ Open, and inherited: every backend in this lineage tests through
 neither quits nor may call =exit()=. glimmer's headless mock backend already
 covers the reconciler, so what needs a substitute is the widget-level smokes;
 =simctl= screenshots are the obvious candidate.
+
+* Milestone 1: the simulator kernel (2026-08-31)
+
+Two clones, both where the recipe said: ChezScheme at =v10.4.1= (with the
+=zlib= and =zuo= submodules) into =~/dev/ChezScheme=, and the jolt repository
+into =~/dev/jolt= beside it, for =tools/cross-compile/make-pack.sh= — the
+Homebrew binary does not carry it.
+
+** The recipe's first line, correctly deleted this time
+
+Yesterday's claim that Homebrew's =chez= lets the recipe "lose its first
+line" was half right. =make bootquick= does need an in-tree host build —
+BUILDING says it "assumes that up-to-date boot files are in place for the
+current machine type". But the =zuo= target behind it takes two flags the
+Makefile never passes: =--host-scheme <command>=, which compiles the cross
+compiler with an /installed/ Scheme instead, and =--xpatch=, which is the
+only thing that makes it leave =xc-<target>/s/xpatch= behind
+(=makefiles/boot.zuo=, line 47 — without the flag there is no xpatch, and
+=re.boot= refuses it outright: "cannot generate xpatch in reboot mode").
+
+So the order of operations inverts: the =--cross= configure comes /first/,
+because it is what builds =bin/zuo= and lays out the workarea, and the boot
+files come second, from Homebrew's =chez=:
+
+#+begin_example
+cd ~/dev/ChezScheme
+SDK=$(xcrun -sdk iphonesimulator --show-sdk-path)
+./configure --cross --force -m=tarm64ios --disable-curses --disable-x11 \
+  CFLAGS="-target arm64-apple-ios-simulator -isysroot $SDK -DTARGET_OS_IPHONE=1 -DDISABLE_CURSES" \
+  LDFLAGS="-liconv" CC_FOR_BUILD=clang
+# → "Configuring for tarm64ios despite missing boot files"   (that is --force)
+make bin/zuo
+bin/zuo tarm64ios bootquick --xpatch --host-scheme /opt/homebrew/bin/chez tarm64ios
+# → "building boot files for tarm64ios using tarm64osx" … 10 seconds …
+#   boot/tarm64ios/{petite.boot,scheme.boot,scheme.h,equates.h,gc-*.inc}
+#   xc-tarm64ios/s/xpatch                                     (2.0 MB)
+make                                                        # target kernel
+#+end_example
+
+One mistake kept: the first attempt put =--host-scheme= /after/ the machine
+name and got =expected optional <machine>: (list "tarm64ios" "--host-scheme"
+…)=. =parse-boot-args= strips =--xpatch=, then looks for =--host-scheme= at
+the head of what remains, and only then treats the leftover as the machine.
+Flags first, machine last.
+
+Ten seconds, from the compiler in the Brewfile. The host-build step the
+recipe budgeted six minutes for is gone, and nothing in the tree was built
+for the host at all — =bin/zuo= is the only host binary, and it is a C file.
+
+** The kernel, in nine seconds
+
+=make= in the cross-configured tree: =libkernel.a= (1.5 MB), static =liblz4.a=
+and =libz.a= built for the target, and — a bonus the recipe never asked for —
+a whole =tarm64ios/bin/tarm64ios/scheme= linked against the simulator SDK.
+The objects are what they should be:
+
+#+begin_example
+$ ar x tarm64ios/boot/tarm64ios/libkernel.a alloc.o && otool -l alloc.o | grep -A4 LC_BUILD_VERSION
+      cmd LC_BUILD_VERSION
+ platform 7          ← iOS Simulator
+    minos 14.0
+      sdk 26.5
+#+end_example
+
+One warning, thirty times: ='DISABLE_CURSES' macro redefined=.
+=--disable-curses= already writes the define into =config.h=, so the copy in
+=CFLAGS= (inherited from mainline's device recipe) is redundant. Harmless;
+dropped from the recipe above the next time it is retyped.
+
+** A hello to cross-compile
+
+Milestone 1's payload is deliberately nothing: a namespace with a =-main=
+that prints. =os.name= is the interesting word — the cross-compile README
+promises it is a runtime call, not a host string baked in at build time, so
+whatever it prints from inside the simulator is the truth about where it ran.
+
+#+begin_src clojure :tangle src/hello/core.clj :mkdirp true :comments link
+(ns hello.core)
+
+(defn -main [& _]
+  (println "hello from" (System/getProperty "os.name")
+           "on" (System/getProperty "os.arch")))
+#+end_src
+
+(=deps.edn= grew =:paths ["src"]= for it.)
+
+** The kernel runs in the simulator before jolt is involved
+
+That bonus =scheme= binary is a Chez REPL linked for the simulator, and
+=simctl spawn= runs any executable inside a booted device's environment. So
+the kernel can be proven on its own, before the target pack or the jolt
+pipeline exist:
+
+#+begin_example
+$ xcrun simctl boot 3E4417C0-3114-43B5-B249-0903F96C6CB9      # iPhone 17, iOS 26.5
+$ cat hello.ss
+(display (list (machine-type) (threaded?) (getenv "SIMULATOR_RUNTIME_VERSION")))(newline)(exit)
+$ B=~/dev/ChezScheme/tarm64ios/boot/tarm64ios
+$ xcrun simctl spawn 3E4417C0-… ~/dev/ChezScheme/tarm64ios/bin/tarm64ios/scheme \
+    -b $B/petite.boot -b $B/scheme.boot -q --script hello.ss
+(tarm64ios #t 26.5)
+#+end_example
+
+Threaded, on the machine type the boots were built for, reading the
+simulator's runtime version out of its own environment. Everything W^X was
+going to make difficult on a device is a non-issue here, as promised.
+
+** The target pack
+
+=make-pack.sh= wants the =CHEZ_SRC= checkout and a machine string, and
+collects the csv, the xpatch and the two static libraries into one directory:
+
+#+begin_example
+$ cd ~/dev/jolt && CHEZ_SRC=~/dev/ChezScheme tools/cross-compile/make-pack.sh tarm64ios ~/dev/pack-tarm64ios-sim
+wrote target pack: /Users/statonjr/dev/pack-tarm64ios-sim
+$ ls ~/dev/pack-tarm64ios-sim ~/dev/pack-tarm64ios-sim/lib
+libkernel.a  link-libs  petite.boot  scheme.boot  scheme.h  xpatch
+liblz4.a  libz.a
+$ cat ~/dev/pack-tarm64ios-sim/link-libs
+-llz4 -lz -lm
+#+end_example
+
+The last line is the fall-through =case= the research predicted — no
+Foundation, no iconv — so =JOLT_TARGET_LINK_LIBS= overrides it at build time.
+The pack lives under =~/dev= rather than =/tmp= because it is ten seconds to
+rebuild but a paragraph to re-explain.
+
+** =jolt build --target=, nineteen seconds
+
+#+begin_example
+$ JOLT_TARGET_CC=clang \
+  JOLT_TARGET_ARCH_FLAG="-target arm64-apple-ios-simulator -isysroot $SDK" \
+  JOLT_TARGET_LINK_LIBS="-L$PACK/lib -llz4 -lz -framework Foundation -liconv -lm" \
+  jolt build -m hello.core -o build/hello --target tarm64ios --target-pack $PACK
+jolt build: compiling hello.core (release mode)
+loading tarm64ios cross compiler
+compiling build/hello.build/flat.ss with output to build/hello.build/flat.so
+jolt build: wrote build/hello
+$ file build/hello
+build/hello: Mach-O 64-bit executable arm64          (LC_BUILD_VERSION platform 7, 25 MB)
+#+end_example
+
+=JOLT_CHEZ= was deliberately left unset: "loading tarm64ios cross compiler"
+is the xpatch going into whichever =chez= is on =PATH=, which is the
+Brewfile's. The =Hello.app= that follows is the same command with the
+output path changed — it is the =bundle= task in =deps.edn=.
+
+** The bundle
+
+The revised milestone list said packaging could not wait for the end, and
+this is why: =simctl install= will not take a bare executable. A simulator
+=.app= is flat (no =Contents/=, unlike the macOS demo's), and this is the
+least =Info.plist= it needs. The bundle directory is ignored by git — the
+plist is tangled, the binary is built, nothing in it is source.
+
+#+begin_src xml :tangle Hello.app/Info.plist :mkdirp true
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>        <string>dev.statonsoftware.glimmer-ios.hello</string>
+  <key>CFBundleExecutable</key>        <string>Hello</string>
+  <key>CFBundleName</key>              <string>Hello</string>
+  <key>CFBundleDisplayName</key>       <string>Hello</string>
+  <key>CFBundlePackageType</key>       <string>APPL</string>
+  <key>CFBundleVersion</key>           <string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array>
+  <key>MinimumOSVersion</key>          <string>14.0</string>
+  <key>UIDeviceFamily</key>            <array><integer>1</integer></array>
+  <key>LSRequiresIPhoneOS</key>        <true/>
+</dict>
+</plist>
+#+end_src
+
+Then, with an iPhone booted:
+
+#+begin_example
+jolt tangle && jolt bundle && jolt install && jolt launch
+#+end_example
+
+** Milestone 1, met — with one word wrong
+
+#+begin_example
+$ jolt bundle && jolt install && jolt launch
+jolt build: wrote ./Hello.app/Hello
+hello from Linux on aarch64
+dev.statonsoftware.glimmer-ios.hello: 18914
+#+end_example
+
+A jolt =-main=, cross-compiled from this notebook, printing from inside an
+installed =.app= on a booted iPhone 17 simulator. Total wall-clock from
+=git clone= to that line: under three minutes, most of it typing. The
+milestone list budgeted a host Chez build, a fallback Android-shaped build,
+and an open question for Dmitri; it needed none of them.
+
+Two things it did surface.
+
+*A task cannot be called =run=.* =jolt run= is a subcommand — "run needs
+-m NS, a FILE, or a task name" — and it wins over a =:tasks= entry of the
+same name. The task is =launch=.
+
+*=os.name= is "Linux".* It /is/ a runtime call, exactly as the cross-compile
+README says; the runtime just does not know it is on iOS. jolt's
+=host-static-methods.ss=:
+
+#+begin_src scheme :tangle no
+;; os.name reflects the actual platform (Chez's machine-type names it): a *osx
+;; machine is macOS, otherwise Linux.
+(define sys-os-name
+  (case (sa-os-family)
+    ((macos) "Mac OS X")
+    ((windows) "Windows")
+    (else "Linux")))
+#+end_src
+
+=tarm64ios= is not =*osx=, so it falls through. Cosmetic in a hello; not
+cosmetic one milestone on, because two things branch on that string:
+
+- =jolt.ffi='s =errno-loc= picks =__error= for "Mac OS X" and
+  =__errno_location= otherwise. iOS is Darwin; its libSystem has =__error=
+  and no =__errno_location=. The first FFI call that reads =errno= on the
+  simulator resolves a symbol that is not there.
+- =glimmer-uikit.ffi= gates its framework loading on =os.name= being
+  "Mac OS X", and the audit already noted its failure mode: a =println=,
+  then every class lookup silently returns null.
+
+The fix belongs upstream, and it is small: =sa-os-family= should classify
+=*ios= as Darwin for the errno decision, and =os.name= wants a value that
+says iOS (there is no JVM precedent to copy — the JVM has never run there;
+"iOS" is what the other JVM-on-iOS projects, RoboVM and its descendants,
+chose). Until it lands, milestone 2 carries a workaround: the guard becomes
+=(machine-type)= or a =-D=-style property set at build time, and =errno-loc=
+is not consulted on this platform. Filed as the first issue this project
+sends upstream.
+
+** Where the tree stands
+
+Untracked by design: =Hello.app/= (built + tangled, nothing in it is source).
+Under =~/dev=: =ChezScheme= (v10.4.1, configured =--cross= for the simulator,
+boots and kernel built), =jolt= (for =make-pack.sh=), and
+=pack-tarm64ios-sim=. The simulator (=3E4417C0-…=, iPhone 17, iOS 26.5) is
+left booted with =Hello= installed.
 
 * References
 
