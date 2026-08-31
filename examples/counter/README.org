@@ -155,3 +155,337 @@ with a =:widget= pointer and a vector of child atoms.
 #+begin_example
 NS=demo.smoke jolt bundle && jolt install && jolt console
 #+end_example
+
+* Live: nREPL into the running counter
+
+The README's W^X section said an on-device nREPL stays a dev-only feature —
+evaluating /downloaded/ code is what the App Store bans — and TODO 4 asked
+for it anyway, because a notebook that can =swap!= a ratom on a phone from
+Emacs is a different kind of notebook. The simulator shares the Mac's
+loopback, so =localhost:7888= is the app; on the phone, =iproxy 7888 7888=
+(libimobiledevice, in the Brewfile) forwards the same port over USB to the
+phone's loopback.
+
+** The =os.name= landmine, detonated
+
+The obvious version — =(jolt.nrepl/start 7888)= before =ui/run= — died on
+the simulator at once:
+
+#+begin_example
+Unhandled exception: socket() failed
+  trace: jolt.nrepl/start (jolt/nrepl.clj:396)
+#+end_example
+
+Milestone 1 recorded that jolt reports =os.name= "Linux" on iOS and predicted
+it would bite one milestone on; this is the bite. =jolt.nrepl= picks its
+socket constants by that string: not-"mac" means Linux, so it ORs
+=SOCK_CLOEXEC= (0x80000, Linux-only) into the socket type and lays out
+=sockaddr_in= without Darwin's =sin_len= byte. Darwin's =socket()= answers
+EINVAL. And =System/getProperty "os.name"= is special-cased upstream, so the
+app cannot lie its way out. The fix belongs upstream (=sa-os-family= should
+call =*ios= Darwin); until then the app owns the socket: a Darwin-correct
+listener of its own, handing each accepted fd to jolt's handler through the
+private seam (=ns-interns= reaches a private var; privacy is a compiler
+check). Everything past =accept= — bencode, sessions, eval — is jolt's.
+
+#+begin_src clojure :tangle ../../src/demo/repl.clj :mkdirp true :comments link
+(ns demo.repl
+  "The counter, with an nREPL server on 7888 — listening through this
+  namespace's own Darwin-correct socket, served by jolt.nrepl's handler."
+  (:require [demo.examples.counter :as counter]
+            [glimmer.core :as ui]
+            [jolt.ffi :as ffi]
+            [jolt.nrepl]))
+
+(def port 7888)
+
+;; Darwin BSD sockets. Not jolt.nrepl's: those pick Linux constants and layout
+;; whenever os.name is not "mac", and on iOS it is "Linux".
+(ffi/defcfn c-socket     "socket"     [:int :int :int] :int)
+(ffi/defcfn c-bind       "bind"       [:int :pointer :int] :int)
+(ffi/defcfn c-listen     "listen"     [:int :int] :int)
+(ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
+(ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-close      "close"      [:int] :int)
+
+(def ^:private AF-INET 2)
+(def ^:private SOCK-STREAM 1)
+(def ^:private SOL-SOCKET 0xffff)     ; Darwin (Linux: 1)
+(def ^:private SO-REUSEADDR 4)        ; Darwin (Linux: 2)
+
+(defn- sockaddr
+  "struct sockaddr_in, Darwin layout: sin_len, sin_family, port (BE), then the
+  address — 127.0.0.1 for :loopback, 0.0.0.0 for :any (Wi-Fi: opt-in only)."
+  [port bind]
+  (let [sa (ffi/alloc 16)]
+    (dotimes [i 16] (ffi/write sa :uint8 i 0))
+    (ffi/write sa :uint8 0 16)
+    (ffi/write sa :uint8 1 AF-INET)
+    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))
+    (ffi/write sa :uint8 3 (bit-and port 0xff))
+    (when (= bind :loopback)
+      (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 7 1))   ; :any leaves 0.0.0.0
+    sa))
+
+(defn- listen! [port bind]
+  (let [fd (c-socket AF-INET SOCK-STREAM 0)]
+    (when (neg? fd) (throw (ex-info "socket() failed" {:port port})))
+    (let [opt (ffi/alloc 4)] (ffi/write opt :int 0 1) (c-setsockopt fd SOL-SOCKET SO-REUSEADDR opt 4) (ffi/free opt))
+    (let [sa (sockaddr port bind)
+          r  (c-bind fd sa 16)]
+      (ffi/free sa)
+      (when (neg? r) (c-close fd) (throw (ex-info "bind() failed" {:port port}))))
+    (when (neg? (c-listen fd 16)) (c-close fd) (throw (ex-info "listen() failed" {:port port})))
+    fd))
+
+(defn- private-fn [sym] (var-get (get (ns-interns 'jolt.nrepl) sym)))
+
+(defn start!
+  "Listen on `port` — :loopback (default; USB via iproxy) or :any (Wi-Fi, an
+  eval server on the LAN: opt in knowingly) — and serve each connection with
+  jolt.nrepl's built-in handler on its own thread. Returns immediately."
+  ([port] (start! port :loopback))
+  ([port bind]
+  (let [fd      (listen! port bind)
+        handler ((private-fn 'build-handler) [])
+        serve   (private-fn 'handle-conn)]
+    (future
+      (loop []
+        (let [conn (c-accept fd ffi/null ffi/null)]
+          (when (>= conn 0)
+            (future (try (serve conn handler)
+                         (catch :default e (println "nrepl conn error:" (ex-message e)) (c-close conn)))))
+          (recur))))
+    (println "demo.repl: nREPL on" (if (= bind :any) "0.0.0.0:" "127.0.0.1:") port "— swap! demo.examples.counter/state")
+    nil)))
+
+(defn -main [& _]
+  (start! port)
+  (ui/run counter/root :title "Counter (live)"))
+#+end_src
+
+Over Wi-Fi it is the same app bound to =0.0.0.0= — a separate namespace, so
+the choice is made at build time and never by accident (=WIFI=1 jolt live=).
+The phone's address comes from Settings → Wi-Fi; the client takes it as =HOST=.
+
+#+begin_src clojure :tangle ../../src/demo/repl_wifi.clj :mkdirp true :comments link
+(ns demo.repl-wifi
+  "The live counter with its nREPL on 0.0.0.0:7888 — reachable over Wi-Fi.
+  An eval server on the LAN, from a phone: build this on purpose."
+  (:require [demo.examples.counter :as counter]
+            [demo.repl :as repl]
+            [glimmer.core :as ui]))
+
+(defn -main [& _]
+  (repl/start! repl/port :any)
+  (ui/run counter/root :title "Counter (live, Wi-Fi)"))
+#+end_src
+
+A scripted client, for proof that does not need an editor: one =eval= op
+over bencode, printing each reply until =done=.
+
+#+begin_src clojure :tangle ../../scripts/nrepl-eval :mkdirp true
+#!/usr/bin/env bb
+;; scripts/nrepl-eval PORT CODE — one nREPL eval over bencode; prints the replies.
+;; HOST=<phone ip> for Wi-Fi (default 127.0.0.1).
+(require '[bencode.core :as b])
+(let [[port code] *command-line-args*
+      port (Integer/parseInt (or port "7888"))]
+  (with-open [s (java.net.Socket. (or (System/getenv "HOST") "127.0.0.1") port)]
+    (let [out (.getOutputStream s)
+          in  (java.io.PushbackInputStream. (.getInputStream s))
+          str-vals (fn [m] (into {} (map (fn [[k v]] [k (cond (bytes? v) (String. v)
+                                                              (sequential? v) (mapv #(if (bytes? %) (String. %) %) v)
+                                                              :else v)]) m)))]
+      (b/write-bencode out {"op" "eval" "code" code "id" "1"})
+      (.flush out)
+      (loop [n 0]
+        (let [m (str-vals (b/read-bencode in))]
+          (println m)
+          (when (and (< n 20) (not (some #{"done"} (get m "status"))))
+            (recur (inc n))))))))
+#+end_src
+
+#+begin_example
+NS=demo.repl jolt bundle && jolt install && jolt launch
+bb scripts/nrepl-eval 7888 '(swap! demo.examples.counter/state update :count + 40)'
+#+end_example
+
+** On the simulator: 40, from the Mac
+
+#+begin_example
+$ NS=demo.repl jolt bundle && jolt install && jolt launch
+$ bb scripts/nrepl-eval 7888 '(swap! demo.examples.counter/state update :count + 40)'
+{id 1, ns user, session none, status [done], value {:count 40}}
+#+end_example
+
+And the label on the simulator read 40. The eval ran on an nREPL thread, so
+the re-render took the =:schedule= route — the same path the smoke proves,
+now driven from an editor's socket instead of a =future=.
+
+Two things the phone attempt taught before it worked:
+
+- *Loopback is shared, so ports collide.* With the simulator's app still
+  listening on the Mac's =127.0.0.1:7888=, =iproxy 7888:7888= bound
+  =*:7888= on IPv6 and reported nothing; the client's =127.0.0.1= went to
+  the simulator, which cheerfully went from 40 to 80 and reported
+  =os.arch= "aarch64" — the simulator's native build, not the phone's
+  =tpb64l=. Forward to a different local port (=iproxy 7889:7888=), or quit
+  the simulator's app first.
+- *=iproxy= is USB.* The phone was paired with Xcode over Wi-Fi
+  (=transportType: localNetwork=), which =devicectl= is happy with and
+  =usbmuxd= is not: =idevice_id -l= listed nothing, and every forwarded
+  connection was reset. Plug the cable in. Wi-Fi would mean binding the
+  server to =0.0.0.0= on a phone, which is not a thing to do.
+
+** On the phone: 40, from the Mac, over a cable
+
+#+begin_example
+$ NS=demo.repl TARGET=device jolt bundle && jolt device       # launch; ^C leaves it running
+$ iproxy -u $DEVICE 7889:7888                                  # in another terminal
+$ bb scripts/nrepl-eval 7889 '[(System/getProperty "os.arch") (swap! demo.examples.counter/state update :count + 40)]'
+{id 1, ns user, session none, status [done], value ["tpb64l" {:count 40}]}
+#+end_example
+
+=tpb64l= is the tell: only the device build reports the portable-bytecode
+machine type, so this is the phone evaluating, not the simulator on the
+shared loopback. The label read 40. An nREPL into a jolt app on an iPhone,
+over USB, with the app interpreting bytecode it was shipped with — and the
+expression it just ran was not.
+
+For an editor: Calva or CIDER, connect to =localhost:7889= (a generic nREPL
+connection; jolt speaks =clone=, =describe=, =eval=, =load-file=, =close=),
+with =iproxy= running in a terminal for as long as the session lasts.
+
+** =jolt live=
+
+Three steps is two too many. =jolt live= builds =demo.repl= for =TARGET=,
+installs and launches it — on the simulator the nREPL is then =localhost:7888=;
+on the phone, =jolt proxy= in a second terminal forwards it to =localhost:7889=.
+
+#+begin_src sh :tangle ../../scripts/live :mkdirp true :comments link
+# jolt live: the counter with its nREPL, on TARGET=sim (default) or device.
+set -eu
+TARGET="${TARGET:-sim}"
+NS=demo.repl; [ "${WIFI:-0}" = 1 ] && NS=demo.repl-wifi   # Wi-Fi: 0.0.0.0, on purpose
+NS="$NS" TARGET="$TARGET" sh scripts/bundle
+case "$TARGET" in
+  sim)
+    xcrun simctl install booted Hello.app
+    xcrun simctl launch booted dev.statonsoftware.glimmer-ios.hello
+    echo "nREPL: localhost:7888  (bb scripts/nrepl-eval 7888 '<expr>')" ;;
+  device)
+    sh scripts/device      # signs, installs, launches with the console attached; ^C leaves it running
+    [ "${WIFI:-0}" = 1 ] && echo "nREPL: HOST=<phone ip> port 7888 (Settings → Wi-Fi)" || echo "now: jolt proxy   (then nREPL: localhost:7889)" ;;
+  *) echo "TARGET must be sim or device" >&2; exit 2 ;;
+esac
+#+end_src
+
+** Over Wi-Fi, on purpose
+
+USB is the safe default and the one =jolt proxy= serves; but the phone
+lives on a hub that drops its keyboards when the phone is plugged in, and
+ClojureDart's =flutter run= lets you pick a wireless device, so the notebook
+should too. Since the app owns the socket, Wi-Fi is one byte in the
+=sockaddr=: =0.0.0.0= instead of =127.0.0.1=. It is a separate namespace
+(=demo.repl-wifi=, built with =WIFI=1 jolt live=) so an eval server on the
+LAN is a decision made at build time and never by accident.
+
+Finding the phone: =dscacheutil= returns one address for =iPhone.local=, and
+on a cabled phone it is the /USB link's/ =169.254.x.x= — which answered, and
+proved the bind, but is not Wi-Fi. Asking mDNS directly returns all of them:
+
+#+begin_example
+$ WIFI=1 TARGET=device jolt live
+demo.repl: nREPL on 0.0.0.0: 7888 — swap! demo.examples.counter/state
+$ dig +short -p 5353 @224.0.0.251 iPhone.local A
+$PHONE
+$ HOST=$PHONE bb scripts/nrepl-eval 7888 '[(System/getProperty "os.arch") (swap! demo.examples.counter/state assoc :count 13)]'
+{id 1, ns user, session none, status [done], value ["tpb64l" {:count 13}]}
+#+end_example
+
+Then the cable came out — =idevice_id -l= empty — and the same eval set 14.
+No USB, no =iproxy=, no debugger, no JIT: an editor on the Mac, a ratom on a
+phone across the room.
+
+** =jolt connect=
+
+jolt ships the server side only — =jolt repl= is a /local/ REPL with no
+=--connect= — so the terminal client is nREPL's own, =nrepl.cmdline=, run
+through the =clj= that is already on the machine. =jolt connect= wraps it:
+USB by default (=localhost:7889=, after =jolt proxy=), or
+=HOST=$PHONE PORT=7888 jolt connect= over Wi-Fi.
+
+#+begin_example
+$ HOST=$PHONE PORT=7888 jolt connect
+user=> (System/getProperty "os.arch")
+"tpb64l"
+user=> (swap! demo.examples.counter/state update :count inc)
+{:count 15}
+#+end_example
+
+** A faster =jolt connect=: babashka
+
+=nrepl.cmdline= is a JVM: a couple of seconds of startup and a deps
+resolution before the first prompt, every time. bb starts in tens of
+milliseconds and already speaks bencode, and jolt's server needs nothing
+more than =eval= — so the terminal client is thirty lines of bb. It prints
+=out=, =err= and =value= as they arrive and tracks the namespace the server
+reports, which is all a prompt needs.
+
+#+begin_src clojure :tangle ../../scripts/nrepl-repl :mkdirp true
+#!/usr/bin/env bb
+;; scripts/nrepl-repl [HOST] [PORT] — a terminal REPL over nREPL, in babashka.
+;; ^D to leave; the server keeps running.
+(require '[bencode.core :as b])
+(let [[host port] *command-line-args*
+      host (or host (System/getenv "HOST") "127.0.0.1")
+      port (Integer/parseInt (or port (System/getenv "PORT") "7889"))
+      ->str (fn [v] (cond (bytes? v) (String. v "UTF-8")
+                          (sequential? v) (mapv #(if (bytes? %) (String. % "UTF-8") %) v)
+                          :else v))
+      sock (try (java.net.Socket. host port)
+                (catch java.net.ConnectException _
+                  (binding [*out* *err*]
+                    (println (str "nothing listening on " host ":" port " — is the app in the foreground? "
+                                  "(iOS suspends backgrounded apps; `jolt wake` relaunches it)")))
+                  (System/exit 1)))
+      out  (.getOutputStream sock)
+      in   (java.io.PushbackInputStream. (.getInputStream sock))
+      rdr  (java.io.BufferedReader. (java.io.InputStreamReader. System/in))]
+  (println (str ";; nREPL " host ":" port " — ^D to leave"))
+  (loop [ns "user" id 0]
+    (print (str ns "=> ")) (flush)
+    (when-let [line (.readLine rdr)]
+      (if (clojure.string/blank? line)
+        (recur ns id)
+        (do (b/write-bencode out {"op" "eval" "code" line "id" (str id) "ns" ns})
+            (.flush out)
+            (recur
+              (loop [ns ns]
+                (let [m (into {} (map (fn [[k v]] [k (->str v)]) (b/read-bencode in)))]
+                  (when-let [o (get m "out")] (print o) (flush))
+                  (when-let [e (get m "err")] (binding [*out* *err*] (print e) (flush)))
+                  (when (contains? m "value") (println (get m "value")))
+                  (let [ns (or (get m "ns") ns)]
+                    (if (some #{"done"} (get m "status")) ns (recur ns)))))
+              (inc id)))))))
+#+end_src
+
+Measured against the phone over Wi-Fi, one expression piped in, warm caches:
+bb =0.11 s=, =nrepl.cmdline= =1.37 s=. So =jolt connect= is the bb client, and
+the JVM one stays as =jolt connect-clj=.
+
+(The first session also left a souvenir: =(swap! state assoc count 0)= with
+=count= unquoted stores the /function/ as a key — ={:count 1, #object[clojure.core$count …] 0}=.
+Harmless, since the view reads =:count=; =(swap! state dissoc count)= evicts it.)
+
+** Suspended, not dead
+
+Minutes after the Wi-Fi session, =jolt connect= got =Connection refused= —
+with the process still listed on the phone. iOS had suspended it (screen
+locked, or another app in front), and a suspended process's listener
+accepts nothing. =jolt wake= — a =devicectl= relaunch, which works over Wi-Fi
+— brings it to the foreground and the prompt returns. The client now says
+so instead of a stack trace. This is TODO 2, lifecycle, making its first
+appearance: keep the phone unlocked and the app in front for a session.
