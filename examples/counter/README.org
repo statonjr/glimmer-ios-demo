@@ -489,3 +489,286 @@ accepts nothing. =jolt wake= — a =devicectl= relaunch, which works over Wi-Fi
 — brings it to the foreground and the prompt returns. The client now says
 so instead of a stack trace. This is TODO 2, lifecycle, making its first
 appearance: keep the phone unlocked and the app in front for a session.
+
+* The app as data (2026-09-01)
+
+Paul deGrandis's shape — Vase, "Unlocking data-driven systems" — applied to
+the counter: the shell ships once, and what it renders is a map,
+={:state … :view …}=, that could have come from anywhere. Three small
+namespaces: =demo.data= interprets the map, =demo.store= reads and writes
+it in the app's Documents directory, =demo.app= is the =-main=. No =eval=
+anywhere. The view is hiccup with two data conventions, each undone by a
+plain function walking the tree:
+
+- =[:state k]= anywhere in the view becomes =(get state k)= at render time;
+- a =:actions [[…]]= prop becomes =:on-click= through the registry, whose
+  spec'd multimethods are the fixed vocabulary — so an unknown action kind
+  is rejected at the boundary, not discovered at the tap.
+
+** =demo.data=
+
+#+begin_src clojure :tangle ../../src/demo/data.clj :mkdirp true :comments link
+(ns demo.data
+  "The app as a map: {:state m :view hiccup}. `render` turns the view into what
+  glimmer mounts — [:state k] references become values, :actions become
+  :on-click closures over the registry. Data in, data out; nothing is eval'd."
+  (:require [clojure.spec.alpha :as s]
+            [clojure.walk :as walk]
+            [demo.registry :as reg]))
+
+;; --- the boundary ------------------------------------------------------------
+(s/def ::state map?)
+(s/def ::view (s/and vector? #(keyword? (first %))))
+(s/def ::app (s/keys :req-un [::state ::view]))
+
+(defn- state-ref? [x]
+  (and (vector? x) (= 2 (count x)) (= :state (first x)) (keyword? (second x))))
+
+(defn- element? [x] (and (vector? x) (keyword? (first x))))
+
+(defn- props [el] (when (map? (second el)) (second el)))
+
+(defn actions-in
+  "Every :actions vector in the view, depth first — what validate! checks."
+  [view]
+  (let [found (atom [])]
+    (walk/postwalk (fn [x] (when (and (element? x) (contains? (props x) :actions))
+                             (swap! found conj (:actions (props x))))
+                     x)
+                   view)
+    @found))
+
+(defn validate!
+  "Throw with an explanation unless `app` is {:state map :view hiccup} and every
+  :actions vector is one the registry knows."
+  [app]
+  (when-not (s/valid? ::app app)
+    (throw (ex-info (str "app.edn: " (s/explain-str ::app app)) {:app app})))
+  (doseq [as (actions-in (:view app))]
+    (when-not (s/valid? ::reg/actions as)
+      (throw (ex-info (str "app.edn: bad :actions " (pr-str as) " — " (s/explain-str ::reg/actions as))
+                      {:actions as}))))
+  app)
+
+;; --- the interpretation ------------------------------------------------------
+(defn- substitute-state [view state]
+  (walk/postwalk (fn [x] (if (state-ref? x) (get state (second x)) x)) view))
+
+(defn- wire-actions [view]
+  (walk/postwalk
+    (fn [x]
+      (if (and (element? x) (contains? (props x) :actions))
+        (let [as (:actions (props x))
+              p  (-> (props x) (dissoc :actions) (assoc :on-click #(reg/execute-actions nil as)))]
+          (into [(first x) p] (drop 2 x)))
+        x))
+    view))
+
+(defn render
+  "The view of `app` with `state` substituted and actions wired: hiccup glimmer
+  can mount. Pure, apart from the closures it makes."
+  [app state]
+  (-> (:view app) (substitute-state state) (wire-actions)))
+#+end_src
+
+The counter, as that map — the same view, with the two conventions where the
+code was. This is also the bundled default, for a first launch with no
+=app.edn= yet:
+
+#+begin_src clojure :tangle ../../src/demo/default_app.clj :mkdirp true :comments link
+(ns demo.default-app
+  "The counter as data: what the app renders until Documents/app.edn says otherwise.")
+
+(def app
+  {:state {:count 0}
+   :view  [:vbox {:spacing 12 :margin 16}
+           [:label {:markup [:span {:size "small" :foreground "#8e939d"} "COUNT"]}]
+           [:label {:markup [:span {:size "xx-large" :weight "bold"} [:state :count]]}]
+           [:hbox {:spacing 8 :homogeneous true}
+            [:button {:label "+ 1"   :actions [[:action/inc]]}]
+            [:button {:label "Reset" :actions [[:action/reset]]}]
+            [:button {:label "- 1"   :actions [[:action/dec]]}]]]})
+#+end_src
+
+** Tests, on the host
+
+#+begin_src clojure :tangle ../../test/demo/data_test.clj :mkdirp true :comments link
+(ns demo.data-test
+  (:require [clojure.spec.alpha :as s]
+            [clojure.test :refer [deftest is testing]]
+            [demo.data :as d]
+            [demo.default-app :as default]
+            [demo.examples.counter]            ; the registry's action kinds
+            [demo.registry :as reg]))
+
+(deftest state-references-become-values
+  (testing "a [:state k] anywhere in the tree is replaced by the value"
+    (is (= [:label {:markup [:span {} 7]}]
+           (d/render {:state {} :view [:label {:markup [:span {} [:state :count]]}]} {:count 7}))))
+  (testing "in props too"
+    (is (= [:label {:label "hi"}]
+           (d/render {:state {} :view [:label {:label [:state :greeting]}]} {:greeting "hi"}))))
+  (testing "a missing key is nil, not an error"
+    (is (= [:label {:label nil}]
+           (d/render {:state {} :view [:label {:label [:state :nope]}]} {})))))
+
+(deftest actions-become-on-click-through-the-registry
+  (let [seen (atom [])]
+    (defmethod reg/action-spec :test/note [_] (s/cat :kind #{:test/note} :v any?))
+    (defmethod reg/run-action! :test/note [_ [_ v]] (swap! seen conj v))
+    (let [[_ p] (d/render {:state {} :view [:button {:label "x" :actions [[:test/note 1] [:test/note 2]]}]} {})]
+      (testing ":actions is gone and :on-click is a closure"
+        (is (not (contains? p :actions)))
+        (is (fn? (:on-click p))))
+      (testing "clicking runs the actions, in order, through the registry"
+        ((:on-click p))
+        (is (= [1 2] @seen))))))
+
+(deftest the-boundary
+  (testing "the default app is valid"
+    (is (= default/app (d/validate! default/app))))
+  (testing "a view that is not hiccup is rejected"
+    (is (thrown? Exception (d/validate! {:state {} :view "nope"}))))
+  (testing "an unknown action kind is rejected before anything renders"
+    (is (thrown? Exception (d/validate! {:state {} :view [:button {:actions [[:action/explode]]}]}))))
+  (testing "actions-in finds every :actions vector, nested or not"
+    (is (= [[[:action/inc]] [[:action/reset]] [[:action/dec]]]
+           (d/actions-in (:view default/app))))))
+
+(deftest the-default-app-renders-the-counter
+  (let [v (d/render default/app {:count 3})]
+    (testing "the count is in the label"
+      (is (= [:span {:size "xx-large" :weight "bold"} 3] (get-in v [3 1 :markup]))))
+    (testing "three buttons, each wired"
+      (is (every? #(fn? (:on-click (second %))) (drop 2 (get v 4)))))))
+#+end_src
+
+** =demo.store=
+
+=HOME= inside an iOS app is the sandbox container, so =$HOME/Documents= is
+the app's own Documents directory — the one Files.app can show, and the one
+that survives relaunches. No file yet means the bundled default; a file
+that fails the boundary is reported and ignored rather than trusted.
+
+#+begin_src clojure :tangle ../../src/demo/store.clj :mkdirp true :comments link
+(ns demo.store
+  "Documents/app.edn: the app as a file. load returns the validated map or the
+  default; save! writes state back into it."
+  (:require [clojure.edn :as edn]
+            [demo.data :as d]
+            [demo.default-app :as default]))
+
+(defn path []
+  (str (or (System/getenv "HOME") ".") "/Documents/app.edn"))
+
+(defn read-app
+  "The app map from Documents/app.edn, validated — or the default when there is
+  no file, or when the file is not an app (which is printed, not thrown: a bad
+  file must not brick the launch)."
+  []
+  (let [p (path)]
+    (if-let [text (try (slurp p) (catch :default _ nil))]
+      (try (d/validate! (edn/read-string text))
+           (catch :default e
+             (println "demo.store:" p "ignored —" (ex-message e))
+             default/app))
+      (do (println "demo.store: no" p "— using the bundled default")
+          default/app))))
+
+(defn save!
+  "Write `app` with `state` folded in. Called at :background — the only
+  lifecycle moment iOS guarantees."
+  [app state]
+  (let [p (path)]
+    (try (spit p (pr-str (assoc app :state state)))
+         (println "demo.store: saved" p)
+         (catch :default e (println "demo.store: save failed —" (ex-message e))))))
+#+end_src
+
+** =demo.app=
+
+The =-main=. Two ratoms: the counter's =state= (the registry's multimethods
+swap it, so it stays the one in =demo.examples.counter=) and =current=, the
+app map itself. The root derefs both, so a =swap!= on either re-renders —
+which means a new =:view= =reset!= over nREPL redraws the app in place, no
+relaunch. =:background= saves; launch loads.
+
+#+begin_src clojure :tangle ../../src/demo/app.clj :mkdirp true :comments link
+(ns demo.app
+  "The shell: renders whatever Documents/app.edn says, through demo.data."
+  (:require [demo.data :as d]
+            [demo.examples.counter :as counter]   ; the registry's action kinds, and state
+            [demo.store :as store]
+            [demo.repl :as repl]
+            [glimmer.core :as ui]
+            [glimmer-ios.core :as ios]
+            [glimmer.ratom :as r]))
+
+(defonce current (r/atom nil))       ; the app map; reset! it to redraw the app
+
+(defn root []
+  (d/render @current @counter/state))
+
+(defn reload!
+  "Read Documents/app.edn again and render it. For an nREPL, after a spit."
+  []
+  (let [app (store/read-app)]
+    (reset! counter/state (:state app))
+    (reset! current app)
+    (:view app)))
+
+(defn -main [& _]
+  (let [app (store/read-app)]
+    (reset! counter/state (:state app))
+    (reset! current app))
+  (ios/on-lifecycle! :background #(store/save! @current @counter/state))
+  (repl/start! repl/port :any)          ; the live seam stays: Wi-Fi, on purpose
+  (ui/run root :title "Counter (data)"))
+#+end_src
+
+#+begin_example
+NS=demo.app TARGET=sim jolt bundle && jolt install && jolt launch
+#+end_example
+
+** The proof, in two acts
+
+Act one is live: a different app =reset!= into the running process over
+nREPL — a new caption, a fourth button whose one tap runs three actions —
+and the screen redraws. No relaunch, no rebuild, and nothing evaluated: the
+map is data, and =demo.data/render= is the only thing that reads it.
+
+Act two is the file: the count set to 5, Safari launched so =:background=
+fires and =demo.store/save!= writes =Documents/app.edn=, then the app
+killed with =--terminate-existing= and launched again.
+
+#+begin_example
+$ NS=demo.app TARGET=sim jolt bundle && jolt install && jolt launch
+demo.store: no …/Documents/app.edn — using the bundled default
+$ bb scripts/nrepl-eval 7888 '(reset! demo.app/current {:state {} :view [… "COUNTER, FROM DATA" … "+ 3" …]})'
+$ bb scripts/nrepl-eval 7888 '(swap! demo.examples.counter/state assoc :count 5)'
+(Safari to the front)                                demo.store: saved …/Documents/app.edn
+$ xcrun simctl terminate booted … && xcrun simctl launch booted …
+$ bb scripts/nrepl-eval 7888 '[(:count @demo.examples.counter/state) (count (get-in @demo.app/current [:view 4]))]'
+value [5 6]                                          ← the saved count; two props + four buttons
+#+end_example
+
+#+caption: After the kill and relaunch: the view from the file, at the count from the file.
+[[file:../../media/data.png]]
+
+And the phone, same script over Wi-Fi, =Documents= being
+=/private/var/mobile/Containers/Data/Application/…/Documents=:
+
+#+begin_example
+value ["tpb64l" 5 6]
+#+end_example
+
+That is deGrandis's demo, on an iPhone, on an interpreter that generates no
+code: the shell shipped once; what it shows arrived as EDN. The sentence for
+Apple is the same one the research section wrote for =pb= — rule 2.5.2
+permits interpreting content bundled with or downloaded by the app; what it
+bans is downloaded /code/, and nothing here can turn EDN into code. The
+registry's spec'd multimethods are the whole vocabulary an =app.edn= can
+speak; =validate!= refuses anything else at the door.
+
+What is left of TODO 3 is the wire: the same map from a URL at launch, with
+Documents as the cache.

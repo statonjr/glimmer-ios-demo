@@ -1688,8 +1688,20 @@ done:
    App Store Connect upload.
 2. +*Lifecycle*+ Done — see the Lifecycle section. A plain launch resumes;
    =applicationWillTerminate:= is a fiction; persist at =:background=.
-3. *Persistence* — a =:storage/write= effect to the Documents dir, restored on
-   a fresh launch (EXP-012's shape); the first effect-as-data on this side.
+3. *The app reads itself from EDN* — +the file: done+ (see [[file:examples/counter/README.org][examples/counter]], "The app
+   as data"); the wire remains. Paul deGrandis's shape (Vase, "Unlocking
+   data-driven systems", 2015): the shell ships once, the /product/ is data.
+   Most of it is already here — hiccup views, =[[:action/inc]]= through the
+   registry's specs, a ratom of a map, an interpreter on =pb= that generates
+   nothing. Two milestones, no =eval= in either:
+   - /the file/: =Documents/app.edn= holds ={:state … :view …}=; the view is
+     hiccup with =:actions [[…]]= and =[:state k]= references, and a plain
+     function turns it into what glimmer renders; =-main= reads it before
+     =ui/run=, =:background= writes state back (the only hook that is real).
+     Persistence (EXP-012) falls out. Proof: =spit= a different view over
+     nREPL, relaunch, a different app — no rebuild, on the phone.
+   - /the wire/: the same EDN from a URL at launch (jolt's =http-client=),
+     Documents as the offline cache. Change the UI on a server.
 4. +*nREPL in the simulator*+ Done, and on the phone too — see
    [[file:examples/counter/README.org][examples/counter]], "Live". It cost the =os.name= landmine going off in
    =jolt.nrepl='s socket constants; the app owns its listener now.
