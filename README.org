@@ -479,7 +479,7 @@ Generated files do not get that kind of edit:
 
 #+begin_src conf :tangle .gitignore :comments link
 .DS_Store
-.clj-kondo
+.clj-kondo/.cache
 .jolt
 .lsp
 .vscode
@@ -505,13 +505,16 @@ once, from any Emacs.
  ;; README.org is the source of truth; `jolt tangle` regenerates this file,
  ;; Brewfile and .gitignore from it. Never edit the tangled files directly.
  :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle </dev/null"
-         ;; Milestone 1: cross-compile hello.core into the simulator bundle
+         ;; Milestone 1: cross-compile hello.core (or NS=screen.core) into the simulator bundle
          ;; (Info.plist is tangled), install it on the booted device, run it
          ;; with stdout attached. The pack is ~/dev/pack-tarm64ios-sim.
-         bundle  "PACK=$HOME/dev/pack-tarm64ios-sim; SDK=$(xcrun -sdk iphonesimulator --show-sdk-path); mkdir -p Hello.app && JOLT_TARGET_CC=clang JOLT_TARGET_ARCH_FLAG=\"-target arm64-apple-ios-simulator -isysroot $SDK\" JOLT_TARGET_LINK_LIBS=\"-L$PACK/lib -llz4 -lz -framework Foundation -liconv -lm\" jolt build -m hello.core -o Hello.app/Hello --target tarm64ios --target-pack $PACK && rm -rf Hello.app/Hello.build"
+         bundle  "PACK=$HOME/dev/pack-tarm64ios-sim; SDK=$(xcrun -sdk iphonesimulator --show-sdk-path); mkdir -p Hello.app && JOLT_TARGET_CC=clang JOLT_TARGET_ARCH_FLAG=\"-target arm64-apple-ios-simulator -isysroot $SDK\" JOLT_TARGET_LINK_LIBS=\"-L$PACK/lib -llz4 -lz -framework Foundation -liconv -lm\" jolt build -m ${NS:-hello.core} -o Hello.app/Hello --target tarm64ios --target-pack $PACK && rm -rf Hello.app/Hello.build"
          install "xcrun simctl install booted Hello.app"
-         ;; not `run`: that is a jolt subcommand, and it wins over a task of the same name
-         launch  "xcrun simctl launch --console booted dev.statonsoftware.glimmer-ios.hello"}}
+         ;; not `run`: that is a jolt subcommand, and it wins over a task of the same name.
+         ;; Plain launch: --console terminates the app when its session ends (milestone 3).
+         launch  "xcrun simctl launch booted dev.statonsoftware.glimmer-ios.hello"
+         ;; stdout of a running app, for as long as you keep the console open
+         console "xcrun simctl launch --console booted dev.statonsoftware.glimmer-ios.hello"}}
 #+end_src
 
 What Homebrew does /not/ replace is the =~/dev/ChezScheme= checkout: =make
@@ -763,6 +766,7 @@ plist is tangled, the binary is built, nothing in it is source.
   <key>MinimumOSVersion</key>          <string>14.0</string>
   <key>UIDeviceFamily</key>            <array><integer>1</integer></array>
   <key>LSRequiresIPhoneOS</key>        <true/>
+  <key>UILaunchScreen</key>            <dict/>   <!-- without it iOS letterboxes the app (see milestone 3) -->
 </dict>
 </plist>
 #+end_src
@@ -835,6 +839,230 @@ Under =~/dev=: =ChezScheme= (v10.4.1, configured =--cross= for the simulator,
 boots and kernel built), =jolt= (for =make-pack.sh=), and
 =pack-tarm64ios-sim=. The simulator (=3E4417C0-…=, iPhone 17, iOS 26.5) is
 left booted with =Hello= installed.
+
+* Milestone 2: the FFI proof (2026-08-31)
+
+Done as a throwaway probe, because the question had a yes/no answer and the
+build takes nineteen seconds. Two things needed proving: that =jolt.ffi=
+/loads/ on the simulator at all — its =errno-loc= is a top-level =def= that,
+given =os.name= "Linux", binds =__errno_location=, a symbol Darwin does not
+have — and that =objc_getClass= round-trips once UIKit is dlopen'd.
+
+#+begin_example
+$ xcrun simctl spawn booted probe
+jolt.ffi loaded; os.name = Linux
+UILabel before UIKit load: 0
+UILabel after  UIKit load: 8383458936
+UIApplication: 8383343176
+NSObject: 8381079048
+#+end_example
+
+Both yes. The first because =defcfn= expands to a Chez =foreign-procedure=,
+which resolves its symbol at first /call/, not at definition — so the wrong
+errno symbol is a landmine, not a wall: nothing steps on it until something
+reads =errno=. The second is the audit's milestone 2 line, verbatim, and it
+confirms the change is the guard, not the path: =UIKit.framework/UIKit= under
+=/System/Library/Frameworks= dlopen's from inside the simulator exactly as
+AppKit does on the Mac.
+
+* Milestone 3, as a spike: something on the screen (2026-08-31)
+
+Before forking glimmer-uikit (milestone 0), a standalone namespace that does
+only the iOS-specific half of its =run*=: build the delegate class at
+runtime, hand its /name/ to =UIApplicationMain=, and put a window up from
+inside the callback. Sixty lines, one label, no reconciler. It borrows
+glimmer-uikit's exact idioms — =objc_msgSend= bound per arity, =class_addMethod=
+with a =foreign-callable= IMP — so the fork can absorb it later rather than
+translate it.
+
+Three choices worth stating:
+
+- =[[UIWindow alloc] init]=, not =initWithFrame:=. Since iOS 13 =init= sizes the
+  window to the main screen, which avoids the one struct /return/ (=CGRect=
+  from =[UIScreen mainScreen].bounds=) this spike would otherwise need. Struct
+  /arguments/ are fine: =setFrame:= takes a =CGRect= as four doubles in
+  =d0=–=d3=, the HFA rule the audit already relies on for =NSRect=.
+- The IMP is =:collect-safe=. =UIApplicationMain= is declared =:blocking=, so
+  the jolt thread is parked when UIKit calls back into it; without the flag,
+  the =jolt.ffi= docstring promises "a nonrecoverable memory fault that no
+  handler can catch".
+- The window goes in an atom. Nothing else retains it.
+
+#+begin_src clojure :tangle src/screen/core.clj :mkdirp true :comments link
+(ns screen.core
+  "Milestone 3 spike: UIApplicationMain from jolt, a window, a label."
+  (:require [jolt.ffi :as ffi]))
+
+;; NOT at top level: jolt build loads this namespace on the HOST before emitting
+;; Scheme, and there is no UIKit.framework on macOS (see the mistake below).
+(defn- load-uikit! []
+  (ffi/load-library "/System/Library/Frameworks/UIKit.framework/UIKit"))
+
+(ffi/defcfn objc-get-class           "objc_getClass"          [:string] :pointer)
+(ffi/defcfn sel-register-name        "sel_registerName"       [:string] :pointer)
+(ffi/defcfn objc-allocate-class-pair "objc_allocateClassPair" [:pointer :string :size_t] :pointer)
+(ffi/defcfn objc-register-class-pair "objc_registerClassPair" [:pointer] :void)
+(ffi/defcfn class-add-method         "class_addMethod"        [:pointer :pointer :pointer :string] :uint8)
+
+;; objc_msgSend at each arity this spike needs (see glimmer-uikit.ffi for why).
+(ffi/defcfn msg0        "objc_msgSend" [:pointer :pointer] :pointer)
+(ffi/defcfn msg0void    "objc_msgSend" [:pointer :pointer] :void)
+(ffi/defcfn msg1pvoid   "objc_msgSend" [:pointer :pointer :pointer] :void)
+(ffi/defcfn msg1s       "objc_msgSend" [:pointer :pointer :string] :pointer)
+(ffi/defcfn msg1i64void "objc_msgSend" [:pointer :pointer :int64] :void)
+(ffi/defcfn msg4dvoid   "objc_msgSend" [:pointer :pointer :double :double :double :double] :void)
+
+;; int UIApplicationMain(int argc, char *argv[], NSString *principal, NSString *delegate)
+;; Never returns; :blocking so the parked jolt thread does not pin the collector.
+(ffi/defcfn ui-application-main "UIApplicationMain" [:int :pointer :pointer :pointer] :int :blocking)
+
+(defn cls [n] (objc-get-class n))
+(defn sel [n] (sel-register-name n))
+(defn nsstring [s] (msg1s (cls "NSString") (sel "stringWithUTF8String:") s))
+(defn new-obj [class-name] (msg0 (msg0 (cls class-name) (sel "alloc")) (sel "init")))
+
+(defonce window (atom nil))
+
+(defn- did-finish-launching
+  "application:didFinishLaunchingWithOptions: — runs on the main thread, inside
+  UIApplicationMain. This is where glimmer's mount-root! will go."
+  [_self _cmd _app _opts]
+  (println "didFinishLaunchingWithOptions: inside UIApplicationMain")
+  (let [win   (new-obj "UIWindow")
+        vc    (new-obj "UIViewController")
+        view  (msg0 vc (sel "view"))
+        label (new-obj "UILabel")]
+    (msg1pvoid view (sel "setBackgroundColor:") (msg0 (cls "UIColor") (sel "whiteColor")))
+    (msg4dvoid label (sel "setFrame:") 20.0 300.0 353.0 60.0)
+    (msg1pvoid label (sel "setText:") (nsstring "hello from jolt"))
+    (msg1i64void label (sel "setTextAlignment:") 1)          ; NSTextAlignmentCenter
+    (msg1pvoid view (sel "addSubview:") label)
+    (msg1pvoid win (sel "setRootViewController:") vc)
+    (msg0void win (sel "makeKeyAndVisible"))
+    (reset! window win)
+    (println "window is key and visible"))
+  1)                                                          ; BOOL YES — :uint8, see below
+
+(defonce ^:private did-finish-cb
+  (ffi/foreign-callable did-finish-launching
+                        [:pointer :pointer :pointer :pointer] :uint8 :collect-safe))
+
+(defn- register-delegate-class!
+  "UIApplicationMain instantiates the delegate itself, by class name — so the
+  class must exist before the call, and the callback reaches jolt through the
+  IMP, not through an instance we hold."
+  []
+  (let [c (objc-allocate-class-pair (cls "NSObject") "GlimmerAppDelegate" 0)]
+    (class-add-method c (sel "application:didFinishLaunchingWithOptions:") did-finish-cb "c@:@@")
+    (objc-register-class-pair c)
+    c))
+
+(defn -main [& _]
+  (load-uikit!)
+  (register-delegate-class!)
+  (println "entering UIApplicationMain")
+  (ffi/with-c-string-array [argv 1] ["Hello"]
+    (ui-application-main 1 argv ffi/null (nsstring "GlimmerAppDelegate"))))
+#+end_src
+
+The =bundle= task takes the namespace from =NS= (default =hello.core=), so:
+
+#+begin_example
+NS=screen.core jolt bundle && jolt install && jolt launch
+#+end_example
+
+** Top-level forms run on the host first
+
+The first build died before the cross compiler was even loaded:
+
+#+begin_example
+Unhandled exception: jolt.ffi/load-library: cannot load /System/Library/Frameworks/UIKit.framework/UIKit
+  at ./src/screen/core.clj:6:1
+  trace: ffi-load-library / load-jolt-file* / aot-compile-and-cache / ldr-load-body / build-binary
+#+end_example
+
+=jolt build='s steps 1–3 /load/ the entry namespace on the host to re-emit it as
+Scheme, so every top-level form executes on macOS once before it ever runs on
+the target. A =defcfn= survives that (a Chez =foreign-procedure= resolves its
+symbol lazily — =UIApplicationMain= is nowhere on the host and nobody minds);
+a =load-library= of a framework macOS does not have does not. The rule for
+this project: anything that is only true on iOS happens inside =-main=. That
+is also, unprompted, the answer to milestone 2's /guard/ question — the guard
+is not an =os.name= check, it is /where the load happens/.
+
+** =:char= is a character
+
+The second build got further than anything before it — and then died on the
+way /out/ of the callback:
+
+#+begin_example
+entering UIApplicationMain
+didFinishLaunchingWithOptions: inside UIApplicationMain
+window is key and visible
+Unhandled exception: Exception in foreign-callable: invalid return value 1 from #<procedure did-finish-launching>
+#+end_example
+
+The IMP was declared =:char= to mean =BOOL=, copying glimmer-uikit's
+=terminate-cb=. But jolt's =:char= maps to Chez's =char= — a Unicode
+character, not a byte — so the integer =1= is not a valid value of it. The
+=jolt.ffi= docstring is explicit that "there is no :bool foreign type"; a
+=BOOL= (one byte on arm64) is =:uint8=. Two consequences: this spike returns
+=1= as =:uint8=, and glimmer-uikit's
+=applicationShouldTerminateAfterLastWindowClosed:= callable has the same bug
+waiting for the first closed window — a second small PR upstream, next to the
+=swap-vals!= one the research section already owes it.
+
+(Also learned: =simctl launch --stdout=FILE= captured nothing from a process
+that died by exception; =--console= under a bounded timeout is how these
+transcripts were taken.)
+
+** Linting the FFI macros
+
+CLAUDE.md wants =clj-kondo= at zero errors before a commit, and =defcfn= and
+=with-c-string-array= define symbols kondo cannot see. The config tangles
+from here; =.gitignore= narrows from =.clj-kondo= to its cache so it is
+committed.
+
+#+begin_src clojure :tangle .clj-kondo/config.edn :mkdirp true
+{:lint-as {jolt.ffi/defcfn              clj-kondo.lint-as/def-catch-all
+           jolt.ffi/with-c-string       clojure.core/let
+           jolt.ffi/with-c-string-array clojure.core/let
+           jolt.ffi/with-alloc          clojure.core/let
+           jolt.ffi/with-out            clojure.core/let
+           jolt.ffi/with-layout         clojure.core/let}}
+#+end_src
+
+** On the screen
+
+#+caption: A jolt UILabel in a jolt UIWindow — the iPhone 17 simulator, iOS 26.5, chrome and all.
+[[file:media/simulator.png]]
+
+#+begin_example
+$ NS=screen.core jolt bundle && jolt install && jolt console
+entering UIApplicationMain
+didFinishLaunchingWithOptions: inside UIApplicationMain
+window is key and visible
+#+end_example
+
+Milestone 3, and the label from milestone 4, from a namespace of seventy
+lines: a delegate class built at runtime, =UIApplicationMain= blocking on
+the jolt main thread, the window made inside the callback. The iOS shape the
+research section predicted — =mount-root!= belongs inside
+=didFinishLaunchingWithOptions:= — is exactly where the window got made.
+
+Two more things the first screenshot taught:
+
+- *=--console= is a leash.* =simctl launch --console= ends its session when
+  the timeout fires, and the simulator host then terminates the app —
+  "Termination requested by simulator host" in the log. It looked like the
+  app exiting after the callback; it was the console leaving. A plain
+  =simctl launch= leaves the process running, so =launch= is that now and
+  =console= is the leash, for when you want the output.
+- *No launch screen means letterboxing.* The first live screenshot had black
+  bars top and bottom and rounded corners: with no =UILaunchScreen= (or
+  storyboard) in =Info.plist=, iOS runs the app in a compatibility layout
+  sized for a much older phone. An empty =UILaunchScreen= dict is the whole
+  fix, and it is in the plist above now.
 
 * References
 
