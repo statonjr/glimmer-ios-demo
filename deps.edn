@@ -1,0 +1,7 @@
+;; [[file:README.org::*Unblocked — and the host Chez is a formula (2026-08-30, later still)][Unblocked — and the host Chez is a formula (2026-08-30, later still):3]]
+{:deps {}   ; milestone 0: glimmer-uikit's deps, minus what iOS cannot load
+
+ ;; README.org is the source of truth; `jolt tangle` regenerates this file,
+ ;; Brewfile and .gitignore from it. Never edit the tangled files directly.
+ :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle </dev/null"}}
+;; Unblocked — and the host Chez is a formula (2026-08-30, later still):3 ends here

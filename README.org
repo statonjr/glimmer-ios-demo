@@ -429,6 +429,90 @@ Tools only. No iOS SDK, no simulator runtime, no =simctl= devices. Milestone
 installed and =xcode-select= pointed at it. That is the next step, and it is
 a download, not a design decision.
 
+*** Unblocked — and the host Chez is a formula (2026-08-30, later still)
+
+Xcode 26.6 landed. The three commands above now answer:
+
+#+begin_example
+$ xcode-select -p
+/Applications/Xcode.app/Contents/Developer
+$ xcodebuild -version
+Xcode 26.6
+Build version 17F113
+$ xcrun -sdk iphonesimulator --show-sdk-path
+.../Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk
+$ xcrun simctl list devices available | grep iPhone
+    iPhone 17 Pro (D3278E8B-…) (Shutdown)
+    iPhone 17 (3E4417C0-…) (Shutdown)
+    …
+#+end_example
+
+(Two notes while checking. The installed jolt was v0.7.28 when this section
+was written — a step behind the v0.7.29 quoted above, which the tap already
+had; =brew upgrade= closed the gap, and =build --target= is in both. And the
+recipe's =cross-compile= tools live in the jolt /repository/, not in the
+Homebrew binary; they need a checkout.)
+
+The recipe's first line — six minutes building a host Chez into =/opt/chez=
+and naming it through =JOLT_CHEZ= — turns out to be unnecessary. Homebrew's
+=chezscheme= formula is *10.4.1*, exactly the tag jolt's CI pins, configured
+=--threads= (jolt requires a threaded Chez) and =--installschemename=chez= —
+so the binary lands on =PATH= as =chez=, the first name =build.ss= probes.
+The host compiler is therefore a Brewfile line, tangled from this document
+the way the macOS demo's is, and installed with =brew bundle --file=./Brewfile=
+(explicit on purpose: anyone with =HOMEBREW_BUNDLE_FILE= pointing at a global
+Brewfile would otherwise install that one instead):
+
+#+begin_src ruby :tangle Brewfile :comments link
+tap  "jolt-lang/jolt"
+brew "jolt-lang/jolt/jolt"   # the jolt runtime/compiler; build --target since 0.7.28
+brew "chezscheme"            # host Chez 10.4.1, threaded, on PATH as `chez` — what a cross build spawns
+tap  "d12frosted/emacs-plus"
+cask "emacs-plus-app"        # tangles this document (the macOS demo says brew "emacs"; this machine runs Emacs+)
+mas  "Xcode", id: 497799835  # the iOS SDK, simulator runtimes and simctl; then xcode-select -s
+#+end_src
+
+The =.gitignore= tangles from here too — it is toolchain residue, and the
+first hand-edit to it (a =printf >>= onto a file with no trailing newline)
+glued =Brewfile.lock.json= onto the =.lsp= line and un-ignored the directory.
+Generated files do not get that kind of edit:
+
+#+begin_src conf :tangle .gitignore :comments link
+.DS_Store
+.clj-kondo
+.jolt
+.lsp
+.vscode
+Brewfile.lock.json
+#+end_src
+
+And the tangle itself is a =jolt= task, borrowed from the macOS demo, so the
+whole regeneration is =jolt tangle=. The =deps.edn= is otherwise empty until
+milestone 0 forks glimmer-uikit into it. One addition, learned the hard way
+while tangling =.gitignore=: =:comments link= runs =comment-region= in the
+block's major mode, and a language with no mode (there is no =gitignore-mode=;
+the block above says =conf=, whose comment is =#=) leaves Emacs waiting on a
+"No comment syntax is defined" minibuffer prompt that never returns in batch.
+=</dev/null= turns that hang into an error. The Clojure blocks below need
+=clojure-mode= for the same reason — =M-x package-install RET clojure-mode=
+once, from any Emacs.
+
+#+begin_src clojure :tangle deps.edn :comments link
+{:deps {}   ; milestone 0: glimmer-uikit's deps, minus what iOS cannot load
+
+ ;; README.org is the source of truth; `jolt tangle` regenerates this file,
+ ;; Brewfile and .gitignore from it. Never edit the tangled files directly.
+ :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle </dev/null"}}
+#+end_src
+
+What Homebrew does /not/ replace is the =~/dev/ChezScheme= checkout: =make
+bootquick XM=tarm64ios= and the =--cross= configure still need a source tree
+at v10.4.1, and the pack's xpatch, boots and kernel come from it. Same
+version on both sides is the whole reason the formula is acceptable as the
+host — an xpatch is compiled Scheme, and it loads into the Chez that spawned
+it only if the versions agree. So the recipe loses its first line and its
+=JOLT_CHEZ=, and keeps everything from =make bootquick= on.
+
 * Milestones
 
 Written for option B, and kept: the shape of the climb barely changes, and
