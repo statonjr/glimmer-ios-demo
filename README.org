@@ -19,19 +19,44 @@ from this document once there is code to tangle.
 
 * What it does, so far (2026-09-01)
 
-Two days in, on an iPhone 16 Pro, on portable bytecode with no JIT:
+Two days in, on an iPhone 16 Pro, on portable bytecode with no JIT. Each
+picture links to the notebook that built it; the full-size media sit beside
+these in =media/=.
 
-#+caption: Flappy Bird — the Android experiment's pure =flappy_bird.cljc=, byte-identical, under a thirty-line iOS owner loop over raylib 6.0 and SDL2, at 60 fps. Recorded on the phone; =media/flappy.mp4= is the full-resolution video. ([[file:examples/flappy/README.org][examples/flappy]])
-[[file:media/flappy.gif]]
+** Flappy Bird
 
-#+caption: raylib's first frame on the phone: its default font and a =DrawCircle=, drawn by a jolt =while= loop inside =UIApplicationMain=. The simulator can no longer display OpenGL ES at all, so every raylib picture here is hardware.
-[[file:media/raylib.png]]
+The Android experiment's pure =flappy_bird.cljc=, byte-identical, under a
+thirty-line iOS owner loop over raylib 6.0 and SDL2, at 60 fps — recorded on
+the phone (=media/flappy.mp4= is the full-resolution video).
+→ [[file:examples/flappy/README.org][examples/flappy]]
 
-#+caption: The counter — the macOS demo's view, character for character, over the glimmer seam on UIKit. (=media/counter.mp4= for Slack and the web.) ([[file:examples/counter/README.org][examples/counter]])
-[[file:media/counter.gif]]
+[[file:media/flappy-small.gif]]
 
-#+caption: The app as data: the same shell, its UI fetched as EDN from a server and negotiated by =Accept-Language= — French here, because the phone asked. Labels travel; the action vocabulary stays in code.
-[[file:media/wire-fr.png]]
+** raylib's first frame
+
+Its default font and a =DrawCircle=, drawn by a jolt =while= loop inside
+=UIApplicationMain=. The simulator can no longer display OpenGL ES at all, so
+every raylib picture in these notebooks is hardware.
+→ [[file:examples/flappy/README.org][examples/flappy]], milestone 2
+
+[[file:media/raylib-small.png]]
+
+** The counter
+
+The macOS demo's view, character for character, over the glimmer seam on
+UIKit (=media/counter.mp4= for Slack and the web).
+→ [[file:examples/counter/README.org][examples/counter]]
+
+[[file:media/counter-small.gif]]
+
+** The app as data, over the wire
+
+The same shell, its UI fetched as EDN from a server and negotiated by
+=Accept-Language= — French here, because the phone asked. Labels travel; the
+action vocabulary stays in code.
+→ [[file:examples/counter/README.org][examples/counter]], "The app as data" and "Content negotiation"
+
+[[file:media/wire-fr-small.png]]
 
 Everything above is tangled from these notebooks: the counter and the wire
 from [[file:examples/counter/README.org][examples/counter]], the bird from [[file:examples/flappy/README.org][examples/flappy]], the backend from
