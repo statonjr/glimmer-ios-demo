@@ -1725,8 +1725,10 @@ done:
 7. *raylib, and Flappy Bird* — a second renderer, as its own example:
    [[file:examples/flappy/README.org][examples/flappy]]. The Android experiment's pure =flappy_bird.cljc=
    unchanged, an iOS owner loop underneath; raylib static in the pack, SDL as
-   the platform layer raylib lacks. Research written 2026-08-31; nothing
-   tangles yet.
+   the platform layer raylib lacks. Research written 2026-08-31; milestones
+   0–4 met by 2026-09-01 — their =flappy_bird.cljc=, byte-identical, playing
+   on the iPhone 16 Pro. Left: the device numbers (milestone 5), and the
+   simulator, which can no longer display OpenGL ES at all.
 
 Not on the list, on purpose: a gesture layer (raylib's touch work has no
 analogue when =UIButton= is the input), and a second UI shape.

@@ -151,9 +151,13 @@ to =xcrun= and =iproxy=. Noted, not pursued.
    finger. Then =GetTouchPosition= by value, once milestone 0 has said yes.+
    Met, 2026-09-01 — and the host (=raylib.host/run!=, a reducer over frames)
    came out of it, plus the 3× render by hand; see "Milestone 3".
-4. *Flappy Bird*: =flappy_bird.cljc= from =6d2b291=, unchanged; an iOS owner
+4. +*Flappy Bird*: =flappy_bird.cljc= from =6d2b291=, unchanged; an iOS owner
    loop of the RAY-018 shape; its 19 tests green under =jolt test=; the bird
-   on the simulator, then the phone. The screenshot for the README.
+   on the simulator, then the phone. The screenshot for the README.+ Met,
+   2026-09-01 — byte-identical (sha recorded), its four tests and nineteen
+   assertions under =jolt test= (15 / 60 in all, from 11 / 41), playing on
+   the iPhone; the simulator is skipped, since it cannot show GLES. See
+   "Milestone 4".
 5. *Device on =pb=*, and the numbers: frame time on an iPhone 16 Pro
    interpreting bytecode, against the collector section's 45× loop figure —
    the first measurement in this notebook where the interpreter's cost might
@@ -1039,3 +1043,347 @@ touch. raylib's SDL platform stores SDL's 64-bit =SDL_FingerID= — on iOS a
 pointer-shaped value — in an =int=; the truncation is stable, and useless for
 telling fingers apart. RAY-010 leaned on point-zero coordinates rather than
 ids, and so does this.
+
+* Milestone 4: Flappy Bird, unchanged (2026-09-01)
+
+The sentence under test, from the Android experiment's README: "the same
+.cljc domain … code could run under Jolt on Linux, macOS, and potentially
+iOS." So =poc.raylib.flappy-bird= comes across /byte for byte/ — fetched raw
+from =jasalt/jolt-android-experiment= at =6d2b291=, embedded here without
+=:comments= so the tangled file carries no breadcrumb and hashes the same:
+
+#+begin_example
+$ shasum -a 256 src/poc/raylib/flappy_bird.cljc
+4d9cf3ae1984613d2e0a4fc25269e147d09e3562d57e12743233b38610a8c560
+#+end_example
+
+Its contract is exactly the host's: =new-game= takes ={:screen [w h]}=,
+=step= takes the state and one input snapshot — ={:metrics … :delta-seconds
+dt :pointer {:phase :press|:down|:idle} :keyboard {:activate? bool}}= — and
+returns the next state; =dimensions= derives every size and rate from the
+screen so a 1206×2622 phone and their 1080×2400 emulator play the same game;
+the 50 ms delta clamp lives inside =step=. No polling, no drawing, no native
+value anywhere in it. The tests come too, also unchanged.
+
+#+begin_src clojure :tangle ../../src/poc/raylib/flappy_bird.cljc :mkdirp true
+(ns poc.raylib.flappy-bird
+  "Pure, deterministic, touch-first Flappy Bird simulation.
+
+  Adapted from the pinned raylib-jlt flappy-bird example's gameplay, but not
+  its window ownership or frame-based simulation. The Raylib host supplies one
+  normalized input snapshot and delta time per frame; this namespace carries no
+  polling, native values, or drawing calls.")
+
+(def max-delta-seconds 0.05)
+(def default-seed 1337)
+
+(defn dimensions
+  "Derive all gameplay geometry and rates from live screen metrics."
+  [metrics]
+  (let [[width height] (:screen metrics)
+        scale (/ (double (min width height)) 450.0)
+        size (fn [n] (max 1.0 (* n scale)))]
+    {:width (double width)
+     :height (double height)
+     :bird-x (* 150.0 scale)
+     :bird-radius (size 14)
+     :gravity (* 1440.0 scale)
+     :flap-velocity (* -420.0 scale)
+     :pipe-width (size 70)
+     :gap-height (size 140)
+     :pipe-spacing (size 300)
+     :scroll-speed (* 180.0 scale)
+     :edge-margin (size 80)}))
+
+(defn- next-random [seed]
+  (mod (+ (* 1103515245 (long seed)) 12345) 2147483648))
+
+(defn- gap-from-seed [seed {:keys [height gap-height edge-margin]}]
+  (let [minimum edge-margin
+        maximum (max minimum (- height edge-margin gap-height))
+        span (inc (long (- maximum minimum)))]
+    [(/ (double (+ minimum (mod seed span))) 1.0) (next-random seed)]))
+
+(defn- pipe [x seed dims]
+  (let [[gap next-seed] (gap-from-seed seed dims)]
+    [{:x (double x) :gap gap :scored? false} next-seed]))
+
+(defn new-game
+  "Create a reproducible game for metrics and an optional integer seed."
+  ([metrics] (new-game metrics default-seed))
+  ([metrics seed]
+   (let [{:keys [width height pipe-spacing]} (dimensions metrics)
+         ;; Keep the first obstacle visible on a phone-sized initial frame;
+         ;; later pipes preserve the stable metric-scaled spacing.
+         first-x (* 0.75 width)]
+     (loop [index 0
+            seed (long seed)
+            pipes []]
+       (if (= index 3)
+         {:seed seed
+          :elapsed 0.0
+          :y (/ height 2.0)
+          :vy 0.0
+          :score 0
+          :over? false
+          :pipes pipes}
+         (let [[next-pipe next-seed]
+               (pipe (+ first-x (* index pipe-spacing)) seed (dimensions metrics))]
+           (recur (inc index) next-seed (conj pipes next-pipe))))))))
+
+(defn activate? [input]
+  (or (= :press (get-in input [:pointer :phase]))
+      (true? (get-in input [:keyboard :activate?]))))
+
+(defn clamp-delta [delta]
+  (max 0.0 (min max-delta-seconds (double (or delta 0.0)))))
+
+(defn- collides? [y {:keys [x gap]} {:keys [bird-x bird-radius pipe-width gap-height]}]
+  (and (< (- bird-x bird-radius) (+ x pipe-width))
+       (> (+ bird-x bird-radius) x)
+       (or (< (- y bird-radius) gap)
+           (> (+ y bird-radius) (+ gap gap-height)))))
+
+(defn- move-pipes [pipes seed dims dt]
+  ;; Replacements use the previous frame's rightmost position. At most one pipe
+  ;; can leave during a clamped frame with the configured spacing.
+  (let [rightmost (apply max (map :x pipes))]
+    (loop [remaining pipes
+           seed seed
+           moved []]
+      (if-let [current (first remaining)]
+        (let [next-x (- (:x current) (* (:scroll-speed dims) dt))]
+          (if (< next-x (- (:pipe-width dims)))
+            (let [[replacement next-seed] (pipe (+ rightmost (:pipe-spacing dims)) seed dims)]
+              (recur (rest remaining) next-seed (conj moved replacement)))
+            (recur (rest remaining) seed (conj moved (assoc current :x next-x)))))
+        [moved seed]))))
+
+(defn- score-pipes [pipes bird-x pipe-width]
+  (reduce (fn [[score updated] pipe]
+            (if (and (not (:scored? pipe)) (< (+ (:x pipe) pipe-width) bird-x))
+              [(inc score) (conj updated (assoc pipe :scored? true))]
+              [score (conj updated pipe)]))
+          [0 []] pipes))
+
+(defn step
+  "Advance one frame. A press edge flaps once; when over, that edge restarts.
+
+  Position uses constant-acceleration integration, so uncollided fixture runs
+  have equivalent positions across 30/60/variable frame partitions. Lifecycle
+  spikes are explicitly capped at `max-delta-seconds`."
+  [state input]
+  (let [metrics (:metrics input)
+        dims (dimensions metrics)
+        flap? (activate? input)
+        dt (clamp-delta (:delta-seconds input))]
+    (cond
+      (:over? state) (if flap? (new-game metrics (:seed state)) state)
+      (zero? dt) state
+      :else
+      (let [initial-vy (if flap? (:flap-velocity dims) (:vy state))
+            next-y (+ (:y state) (* initial-vy dt) (* 0.5 (:gravity dims) dt dt))
+            next-vy (+ initial-vy (* (:gravity dims) dt))
+            [moved-pipes next-seed] (move-pipes (:pipes state) (:seed state) dims dt)
+            [passed scored-pipes] (score-pipes moved-pipes (:bird-x dims) (:pipe-width dims))
+            collision? (or (< (- next-y (:bird-radius dims)) 0.0)
+                           (> (+ next-y (:bird-radius dims)) (:height dims))
+                           (some #(collides? next-y % dims) scored-pipes))]
+        (assoc state
+               :seed next-seed
+               :elapsed (+ (:elapsed state) dt)
+               :y next-y
+               :vy next-vy
+               :pipes scored-pipes
+               :score (+ (:score state) passed)
+               :over? (boolean collision?))))))
+
+(defn ^:export scene
+  "Gallery scene descriptor. Rendering remains in the owner-affine host."
+  []
+  {:id :flappy-bird
+   :title "Flappy Bird"
+   :init (fn [input] [(new-game (:metrics input)) [[:scene/init :flappy-bird]]])
+   :update (fn [state input] [(step state input) []])
+   :draw (fn [state _] [state []])
+   :dispose (fn [state] [state [[:scene/dispose :flappy-bird]]])})
+#+end_src
+
+#+begin_src clojure :tangle ../../test/poc/raylib/flappy_bird_test.cljc :mkdirp true
+(ns poc.raylib.flappy-bird-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [poc.raylib.flappy-bird :as flappy]))
+
+(def metrics {:screen [1080 2400]})
+
+(defn input
+  ([dt] (input dt :idle))
+  ([dt phase]
+   {:metrics metrics
+    :delta-seconds dt
+    :pointer {:phase phase}
+    :keyboard {:activate? false}}))
+
+(defn advance [state partitions]
+  (reduce (fn [current dt] (flappy/step current (input dt))) state partitions))
+
+(deftest deterministic-seeded-fixture-test
+  (let [game (flappy/new-game metrics 42)
+        dims (flappy/dimensions metrics)]
+    (is (= game (flappy/new-game metrics 42)))
+    (is (not= (mapv :gap (:pipes game))
+              (mapv :gap (:pipes (flappy/new-game metrics 43)))))
+    (is (< (:x (first (:pipes game))) (:width dims)))
+    (is (> (+ (:x (first (:pipes game))) (:pipe-width dims)) 0.0))))
+
+(deftest equivalent-elapsed-time-fixtures-test
+  (let [initial (flappy/new-game metrics 9)
+        thirty (advance initial (repeat 3 (/ 1.0 30.0)))
+        sixty (advance initial (repeat 6 (/ 1.0 60.0)))
+        variable (advance initial [0.02 0.03 0.02 0.03])]
+    (testing "constant acceleration and scrolling remain stable across partitions"
+      (doseq [state [thirty sixty variable]]
+        (is (false? (:over? state))))
+      (is (< (Math/abs (- (:y thirty) (:y sixty))) 0.00001))
+      (is (< (Math/abs (- (:y thirty) (:y variable))) 0.00001))
+      (is (< (Math/abs (- (get-in thirty [:pipes 0 :x])
+                          (get-in sixty [:pipes 0 :x])))
+             0.00001)))))
+
+(deftest press-edge-and-restart-test
+  (let [initial (flappy/new-game metrics 7)
+        pressed (flappy/step initial (input (/ 1.0 60.0) :press))
+        held (flappy/step pressed (input (/ 1.0 60.0) :down))
+        over (assoc pressed :over? true)
+        restarted (flappy/step over (input (/ 1.0 60.0) :press))]
+    (testing "only an edge starts a flap; a held contact follows normal gravity"
+      (is (= (:flap-velocity (flappy/dimensions metrics))
+             (- (:vy pressed) (* (:gravity (flappy/dimensions metrics)) (/ 1.0 60.0)))))
+      (is (> (:vy held) (:vy pressed))))
+    (testing "a game-over press deterministically restarts once"
+      (is (false? (:over? restarted)))
+      (is (= 0 (:score restarted)))
+      (is (= (:pipes (flappy/new-game metrics (:seed over))) (:pipes restarted))))))
+
+(deftest collision-score-and-delta-clamp-test
+  (let [dims (flappy/dimensions metrics)
+        base (flappy/new-game metrics 3)
+        scored-state (assoc base :pipes [{:x (- (:bird-x dims) (:pipe-width dims) 1.0)
+                                         :gap 900.0 :scored? false}])
+        scored (flappy/step scored-state (input (/ 1.0 60.0)))
+        collided (flappy/step (assoc base :y 3.0 :vy -50.0)
+                              (input (/ 1.0 60.0)))
+        capped (flappy/step base (input 9.0))]
+    (is (= 1 (:score scored)))
+    (is (true? (:over? collided)))
+    (is (= flappy/max-delta-seconds (:elapsed capped)))
+    (is (< (:elapsed capped) 1.0))))
+#+end_src
+
+** The iOS owner loop
+
+Their desktop adapter (=flappy_desktop_smoke.clj=) is the model: build the
+snapshot, call =step=, draw from =dimensions= and the state. Here the snapshot's
+=:pointer :phase= is the touch count's edge — 0 → 1 is =:press=, held is
+=:down=, nothing is =:idle= — and the delta is =GetFrameTime=, which =step=
+clamps itself. Drawing is the adapter's, translated to =raylib.host='s
+bindings and scaled text. Every flap and every game over goes to the console,
+because that is where the simulator would have been.
+
+#+begin_src clojure :tangle ../../src/raylib/flappy.clj :mkdirp true :comments link
+(ns raylib.flappy
+  "examples/flappy milestone 4: the Android experiment's pure Flappy Bird,
+  unchanged, under the iOS owner loop. The host hands this one input snapshot
+  and a delta per frame (RAY-018's contract); it draws what comes back."
+  (:require [poc.raylib.flappy-bird :as flappy]
+            [raylib.host :as rl]))
+
+(def DARKGREEN (rl/rgba 0 117 44 255))
+(def GOLD      (rl/rgba 255 203 0 255))
+
+(defn- metrics [] {:screen [(rl/get-screen-width) (rl/get-screen-height)]})
+
+(defn- init [{:keys [scale]}]
+  {:k scale :touches 0 :frame 0 :game (flappy/new-game (metrics) flappy/default-seed)})
+
+(defn- phase
+  "The touch count's edge, as the sim's pointer phase."
+  [n previous]
+  (cond (and (pos? n) (zero? previous)) :press
+        (pos? n)                         :down
+        :else                            :idle))
+
+(defn- draw! [{:keys [k game]} m]
+  (let [{:keys [height bird-x bird-radius pipe-width gap-height]} (flappy/dimensions m)
+        px (fn [v] (int (* k v)))]
+    (rl/clear-background rl/SKYBLUE)
+    (doseq [{:keys [x gap]} (:pipes game)]
+      (rl/draw-rectangle (int x) 0 (int pipe-width) (int gap) DARKGREEN)
+      (rl/draw-rectangle (int x) (int (+ gap gap-height)) (int pipe-width)
+                         (int (- height gap gap-height)) DARKGREEN))
+    (rl/draw-circle (int bird-x) (int (:y game)) (double bird-radius) GOLD)
+    (rl/draw-text (str "score " (:score game) "   " (rl/get-fps) " fps") (px 24) (px 80) (px 20) rl/DARKGRAY)
+    (when (:over? game)
+      (rl/draw-text "GAME OVER - TAP TO RESTART" (px 24) (int (/ height 2.0)) (px 22) rl/MAROON))))
+
+(defn- frame [{:keys [touches game] :as s}]
+  (let [m     (metrics)
+        n     (rl/get-touch-point-count)
+        input {:metrics m
+               :delta-seconds (rl/get-frame-time)
+               :pointer {:phase (phase n touches)}
+               :keyboard {:activate? false}}
+        game' (flappy/step game input)
+        s'    (assoc s :touches n :game game' :frame (inc (:frame s)))]
+    (when (= :press (get-in input [:pointer :phase]))
+      (println "flappy: flap at frame" (:frame s') "score" (:score game') (if (:over? game) "(restart)" "")))
+    (when (and (:over? game') (not (:over? game)))
+      (println "flappy: game over at frame" (:frame s') "score" (:score game')
+               "elapsed" (format "%.1f" (:elapsed game')) "s"))
+    (draw! s' m)
+    s'))
+
+(defn -main [& _]
+  (rl/run! {:title "Flappy Bird" :init init :frame frame}))
+#+end_src
+
+The test runner's namespace list (in [[file:../../glimmer-ios/widget.org][glimmer-ios/widget.org]], "Headless
+tests") gains =poc.raylib.flappy-bird-test=, so their four tests run under
+=jolt test= beside this project's own.
+
+#+begin_example
+NS=raylib.flappy TARGET=device sh scripts/raylib && jolt device      # tap to flap
+#+end_example
+
+** Met — their bird, on the phone
+
+#+begin_example
+$ shasum -a 256 src/poc/raylib/flappy_bird.cljc
+4d9cf3ae1984613d2e0a4fc25269e147d09e3562d57e12743233b38610a8c560       ← the Android file, unchanged
+$ NS=raylib.flappy TARGET=device sh scripts/raylib && jolt device
+host: 402 x 874 points × scale 3.0 → screen 1206 x 2622 drawable 1206 x 2622 fbo 1
+flappy: game over at frame 47 score 0 elapsed 0.8 s
+flappy: flap at frame 177 score 0 (restart)
+flappy: flap at frame 203 score 0
+flappy: game over at frame 242 score 0 elapsed 1.1 s
+flappy: flap at frame 292 score 0 (restart)
+flappy: flap at frame 318 score 0
+#+end_example
+
+The first line of play is the sim's own honesty: nobody had tapped yet, and
+at these metrics (=dimensions= scales gravity by =min(w,h)/450=, so 1206 px
+gives 2.68×) the bird falls from mid-screen to the floor in 0.8 s. Then a tap
+restarts, a tap flaps, gravity wins again — the RAY-018 press-edge semantics
+exactly, from a finger instead of =adb input tap=. Same seed, same pipes as
+the Android emulator saw: =default-seed 1337=, and =new-game= is a function.
+
+What ran, layer by layer: a pure =.cljc= written for Android, byte-identical;
+an owner loop of thirty lines over =raylib.host=; raylib 6.0 on SDL2, static
+in the pack; a Chez kernel on portable bytecode with every draw call a libffi
+call; on an iPhone 16 Pro with no JIT. The Android experiment's sentence —
+"the same .cljc domain … code could run under Jolt on … potentially iOS" —
+loses its "potentially".
+
+Host side, =jolt test= went from 11 tests / 41 assertions to 15 / 60: their
+four =deftest=​s and nineteen assertions, unchanged, green under this
+project's runner.

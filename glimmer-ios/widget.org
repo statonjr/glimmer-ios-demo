@@ -586,7 +586,8 @@ only — so =jolt test= runs on the host, and on Linux CI.
     :else nil))
 
 (defn -main [& _]
-  (let [namespaces '[glimmer-ios.widget-test demo.data-test]]
+  (let [namespaces '[glimmer-ios.widget-test demo.data-test
+                     poc.raylib.flappy-bird-test]]   ; examples/flappy: the Android experiment's sim, unchanged
     (doseq [ns namespaces]
       (try (require ns :reload)
            (catch Exception e
