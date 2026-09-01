@@ -1,0 +1,799 @@
+#+title: Flappy Bird on iOS
+#+author: Larry Staton
+#+date: 31 August 2026
+
+A second example, and a second renderer. The counter proved the glimmer seam
+over UIKit; this one asks whether [[https://github.com/raysan5/raylib][raylib]] — a C game library, bound from jolt
+over its bare C ABI by [[https://github.com/jlt-commons/raylib-jlt][raylib-jlt]] and [[https://github.com/jlt-commons/raygui-jlt][raygui-jlt]] — can draw on an iPhone. The
+target is not a port of those examples but something better shaped: the
+[[https://github.com/jasalt/jolt-android-experiment][jolt-android-experiment]]'s Flappy Bird ([[https://github.com/jasalt/jolt-android-experiment/tree/6d2b291d8098d8abc76431b6d9f851b9ee329934/experiments/RAY-018-flappy-bird][RAY-018]]) is a /pure/ =.cljc= — no
+polling, no drawing, no native values; an owner loop hands it an input snapshot
+and a delta and draws what comes back. Its own README says the point of that
+shape is that "the same .cljc domain … code could run under Jolt on Linux,
+macOS, and potentially iOS." This notebook tests the sentence: *their
+simulation, unchanged, an iOS owner loop underneath.*
+
+Like the main notebook, this starts as the research that says the attempt is
+worth making, and accretes the experiment as it happens. Nothing tangles yet.
+
+* Research findings (2026-08-31)
+
+** What Android already proved, experiment by experiment
+
+Read at =6d2b291=, the RAY series is a ladder, and most rungs carry over:
+
+- *RAY-002* — raylib builds /statically/ into the host image with its Android
+  platform layer (=android_main → main=); dynamic deps are only the platform's
+  (=EGL=, =GLESv2=, =OpenSLES=, =log=, =c=, =m=, =dl=). Assembly first, before
+  any managed runtime, so failures stay attributable.
+- *RAY-005/006* — jolt as a /library/ (=jolt build --library=, =ffi/export!=,
+  =jolt_library_init= / =jolt_lookup= / =jolt_library_shutdown=), =dlopen='d by
+  the C host and entered on the host's own thread. Everything — init, lookup,
+  calls, shutdown — on one OS thread.
+- *RAY-007, "Topology A"* — jolt's FFI resolves raylib symbols from the
+  /already-loaded process image/: one raylib, statically linked into the host,
+  found through a =:jolt/native= entry marked =:optional true= (so the cross
+  build does not try to load it) with =--export-dynamic= on the host. A pure
+  =:process true= declaration was tried first and did not suffice there
+  (=process-only-reduction.txt=).
+- *RAY-009* — the part that matters most: after the host enters jolt once,
+  *jolt owns the loop*. =InitWindow=, =WindowShouldClose=, =BeginDrawing=,
+  =EndDrawing=, =CloseWindow= — all called from Clojure, on the
+  native-app-glue thread, for 905 seconds, across a lock/unlock. No C callback
+  re-enters jolt per frame. (A variadic =TraceLog= call killed the process and
+  was removed — no variadics across the FFI.)
+- *RAY-010* — touch through raylib's /scalar/ API (=GetTouchPointCount=,
+  point-zero x/y, touch-as-mouse press/down/release), kept out of portable
+  state; =GetTouchPosition= returns =Vector2= /by value/ and was deferred to a
+  separate aggregate-ABI experiment (RAY-012).
+- *RAY-017/018* — a debug nREPL into the running host, and Flappy Bird: the
+  pure =.cljc= (19 tests, 96 assertions on the host), a press-/edge/ flaps, the
+  delta clamped to 50 ms so a resume cannot teleport the bird. Drawing and
+  input stay in the owner loop.
+
+Their conclusion, carried forward whole: keep the simulation pure, keep native
+values out of it, let one thread own raylib, and prove assembly before
+behaviour.
+
+** Where iOS differs, and where it does not
+
+*The binary is ours.* Android's topology is embedded-core: a C host, jolt as a
+library. This project's is inverted — =jolt build --target= emits the whole
+executable, and it is /Chez/ that owns =main=. That is a simplification here,
+not a complication: no =jolt_lookup=, no export table, no second image to
+resolve symbols from. raylib becomes a static archive in the target pack and a
+=-lraylib= on the link line, exactly as =libffi.a= did in milestone 5, and every
+=defcfn= resolves against the process at first call. (If the bindings are taken
+as a dependency rather than copied, their =:jolt/native= naming =libraylib.dylib=
+is the GTK4 wall again; the copy-the-subset move this notebook already made with
+glimmer-uikit avoids the question, and jolt's =:process true= is the other
+door.)
+
+*raylib has no iOS platform layer.* =src/platforms/= at upstream head is
+android, desktop_glfw, desktop_rgfw, desktop_sdl, desktop_win32, drm, web —
+and =rcore_template.c=. Issue #330, "Try to support iOS platform", closed in
+2018 without one. A from-scratch =rcore_ios.c= is a UIWindow, a GLES layer
+(rlgl already speaks GLES2 — that is the Android build), touch, and the loop:
+several hundred lines of Objective-C/C, with =rcore_android.c= as the model.
+
+*The shortcut is SDL.* raylib's =PLATFORM_DESKTOP_SDL= backend exists, and SDL
+supports iOS properly — UIKit window, GLES and Metal, touch reported as mouse
+by default, orientation, the lot. Building SDL for iOS is well-trodden; raylib
+on SDL on iOS is not, but it collapses the platform layer to "build SDL", and
+it keeps the thing RAY-009 proved: SDL on iOS permits a /blocking/ main loop
+(it spins the run loop from inside =SDL_PumpEvents=), so raylib-jlt's
+=(while (not (should-close?)) …)= may survive as written. The recommended form
+is =SDL_iPhoneSetAnimationCallback= — a frame callback — which is this
+notebook's =:collect-safe= foreign-callable shape if the blocking loop turns
+out to misbehave in the background.
+
+*How =main= meets =UIApplicationMain=.* SDL's own =main= calls
+=SDL_UIKitRunApp(argc, argv, SDL_main)=, which runs =UIApplicationMain= with
+SDL's delegate and calls =SDL_main= from inside it. Chez owns =main= here, so
+the plan is to call =SDL_UIKitRunApp= /ourselves/ through the FFI, =:blocking=,
+passing a =:collect-safe= foreign-callable as =SDL_main= — which is
+=screen.core= exactly: a blocking call into UIKit's loop, a callback that runs
+inside it, and the whole raylib loop living in that callback. Untested; this is
+the first real question.
+
+*Portable bytecode and structs by value.* On the phone every foreign call goes
+through libffi. raylib passes =Color=, =Vector2=, =Rectangle= by value in nearly
+every signature — the aggregate ABI that RAY-010 deferred and RAY-012 took on
+for Android. libffi handles arm64 by-value aggregates, and raylib-jlt already
+binds =[:by-value …]= (its 0.7.23 floor), so the expectation is "works"; it is
+still the cheapest decisive probe and goes first.
+
+*Loop ownership under iOS lifecycle.* iOS suspends a backgrounded app mid-loop
+and resumes it in place — the Lifecycle section found the parked Chez thread
+does nothing remarkable across that. A blocking raylib loop should be the same
+case. RAY-018's 50 ms delta clamp is what makes the resume invisible to the
+bird; it comes along.
+
+** raygui, and the app as data
+
+raygui is immediate-mode: a button is =(gui-button rect "label")= returning
+whether it was pressed, called every frame. That is a second renderer for
+=demo.data= — the same ={:state … :view …}= from the same negotiated wire, with
+=render= emitting raygui calls instead of hiccup. The app-as-data claim
+surviving a renderer swap would say more than either demo alone. Later; the
+bird comes first.
+
+** An aside: babashka grew an FFI
+
+[[https://blog.michielborkent.nl/babashka-ffi.html][babashka.ffi]] is =java.lang.foreign= (Panama) under the hood — Mac, Windows,
+Linux; callbacks; struct "places" — the same no-wrapper, no-codegen school as
+=jolt.ffi=, and the same =defcfn= shape. It does not run on a phone, so it
+changes nothing on the device; on the Mac it means the notebook's bb scripts
+could call CoreFoundation or libimobiledevice directly instead of shelling out
+to =xcrun= and =iproxy=. Noted, not pursued.
+
+* Milestones
+
+0. +*By-value structs on =pb=*: a throwaway that links a stub C function taking
+   and returning a 4-byte struct and a 2-float struct, called through
+   =[:by-value …]= on the phone. Nineteen seconds to build; decisive.+ Met,
+   2026-08-31 — five shapes, 5/5 on the simulator and 5/5 on the phone; see
+   "Milestone 0" below.
+1. +*Assembly*: SDL and raylib (=PLATFORM_DESKTOP_SDL=, =GRAPHICS_API_OPENGL_ES2=)
+   cross-built as static archives for the simulator, into the pack's =lib/=;
+   =-lSDL2 -lraylib= and the frameworks on the link line; =InitWindow= from
+   =-main=. RAY-002's discipline: does it /link/, before anything draws.+ Met,
+   2026-08-31 — =-force_load=, not =-l=, and =SDL_GetPlatform= says iOS; see
+   "Milestone 1" below. (=InitWindow= itself waits for milestone 2: on iOS it
+   cannot run before =UIApplicationMain=.)
+2. +*The loop meets UIApplicationMain*: =SDL_UIKitRunApp= from the FFI with a
+   =:collect-safe= =SDL_main=; raylib-jlt's =core= example — a window, a colour,
+   a line of text — running its =while= loop inside. If blocking misbehaves,
+   the animation callback.+ Met, 2026-09-01, on the iPhone — the blocking loop
+   held at 60 fps; the simulator cannot display OpenGL ES any more (Apple's
+   regression, sources in "Milestone 2"). Four findings on the way, all kept.
+3. *Touch*: RAY-010's scalar polling, the press edge, a marker under the
+   finger. Then =GetTouchPosition= by value, once milestone 0 has said yes.
+4. *Flappy Bird*: =flappy_bird.cljc= from =6d2b291=, unchanged; an iOS owner
+   loop of the RAY-018 shape; its 19 tests green under =jolt test=; the bird
+   on the simulator, then the phone. The screenshot for the README.
+5. *Device on =pb=*, and the numbers: frame time on an iPhone 16 Pro
+   interpreting bytecode, against the collector section's 45× loop figure —
+   the first measurement in this notebook where the interpreter's cost might
+   actually be visible.
+
+Not on this list: the gesture layer beyond taps, audio, and raygui — see above.
+
+* References
+
+- [[https://github.com/jasalt/jolt-android-experiment/tree/6d2b291d8098d8abc76431b6d9f851b9ee329934/experiments][jolt-android-experiment, experiments/]] at =6d2b291= — RAY-002 (static raylib
+  host), RAY-007 (Topology A), RAY-009 (jolt-owned loop), RAY-010 (scalar touch),
+  RAY-018 (Flappy Bird, pure).
+- [[https://github.com/jlt-commons/raylib-jlt][raylib-jlt]] — the bindings (=net.b12n.raylib-jlt.raylib=) and 40-odd examples;
+  =:jolt/min-version "0.8.0"= (=ffi/write= argument order changed there).
+- [[https://github.com/jlt-commons/raygui-jlt][raygui-jlt]] — header-only raygui compiled to a shared library, 24 examples.
+- [[https://github.com/raysan5/raylib/tree/master/src/platforms][raylib src/platforms]] — no iOS; =rcore_desktop_sdl.c= and =rcore_template.c=.
+- [[https://wiki.libsdl.org/SDL2/README/ios][SDL2 on iOS]] — the blocking main loop, =SDL_iPhoneSetAnimationCallback=,
+  =SDL_UIKitRunApp=.
+- [[https://blog.michielborkent.nl/babashka-ffi.html][babashka.ffi]] — the aside above.
+
+* Milestone 0: structs by value, on =pb= (2026-08-31)
+
+The question, precisely: raylib's signatures pass =Color= (4 bytes, one
+register), =Vector2= (8 bytes, a homogeneous float aggregate), =Rectangle=
+(16 bytes, the largest HFA) and =Camera2D= (24 bytes — over the limit, so the
+arm64 ABI passes it /indirectly/, by hidden pointer) by value, and return
+=Vector2= by value (=GetTouchPosition=, =GetMousePosition=). On the simulator a
+native Chez emits its own call stubs; on the phone every foreign call is a
+libffi =ffi_call= with a libffi-described aggregate. Same jolt code, two
+mechanisms — so the probe runs on both, and the simulator is the control.
+
+jolt's shape for this, from the CHANGELOG: a by-value argument is
+=[:by-value [:struct …]]= and the value passed is a pointer to caller-owned
+struct bytes; a by-value /return/ adds a destination pointer as the jolt
+function's *first* argument, filled and handed back. raylib-jlt stages its one
+=Vector2= exactly so (=circle-gradient!=), which is the pattern copied here.
+
+** A stub library that only moves structs
+
+Nothing raylib yet — assembly before behaviour (RAY-002). Five functions whose
+answers are known, with values chosen to be exactly representable in a float,
+so equality is honest:
+
+#+begin_src c :tangle ../../src/probe/by_value.c :mkdirp true
+/* examples/flappy, milestone 0: raylib's struct shapes, by value, no raylib. */
+#include <stdint.h>
+
+typedef struct { uint8_t r, g, b, a; } Color;                     /*  4 bytes: one integer register   */
+typedef struct { float x, y; } Vector2;                           /*  8 bytes: HFA, two float regs    */
+typedef struct { float x, y, width, height; } Rectangle;          /* 16 bytes: HFA, four float regs   */
+typedef struct { Vector2 offset, target; float rotation, zoom; } Camera2D;  /* 24 bytes: indirect  */
+
+Color   probe_color_invert   (Color c)              { return (Color){ (uint8_t)(255 - c.r), (uint8_t)(255 - c.g), (uint8_t)(255 - c.b), c.a }; }
+Vector2 probe_vector2_add    (Vector2 a, Vector2 b) { return (Vector2){ a.x + b.x, a.y + b.y }; }
+float   probe_rectangle_area (Rectangle r)          { return r.width * r.height; }
+Vector2 probe_touch_position (int i)                { return (Vector2){ 12.5f * (float)i, 34.25f }; }   /* GetTouchPosition's shape */
+float   probe_camera_zoom    (Camera2D c)           { return c.zoom + c.offset.x; }
+#+end_src
+
+** The probe
+
+Descriptors are literals at every use — =defcfn= and =layout= are macros that
+want the shape at compile time, so a =def='d descriptor cannot be spliced in.
+=write-field= / =read-field= rather than raw =ffi/write=, whose argument order
+changed in 0.8.0 (raylib-jlt's =deps.edn= says so); the field forms are stable
+across both.
+
+#+begin_src clojure :tangle ../../src/probe/core.clj :mkdirp true :comments link
+(ns probe.core
+  "examples/flappy milestone 0: raylib's by-value struct shapes through jolt.ffi,
+  on the simulator (native Chez, its own stubs) and the phone (pb: every call
+  through libffi). Prints one line per case and a tally."
+  (:require [jolt.ffi :as ffi]))
+
+(def color-l  (ffi/layout [:struct [[:r :uint8] [:g :uint8] [:b :uint8] [:a :uint8]]]))
+(def vec2-l   (ffi/layout [:struct [[:x :float] [:y :float]]]))
+(def rect-l   (ffi/layout [:struct [[:x :float] [:y :float] [:width :float] [:height :float]]]))
+(def camera-l (ffi/layout [:struct [[:offset [:struct [[:x :float] [:y :float]]]]
+                                    [:target [:struct [[:x :float] [:y :float]]]]
+                                    [:rotation :float] [:zoom :float]]]))
+
+;; a by-value RETURN takes the destination pointer as the first jolt argument
+(ffi/defcfn color-invert "probe_color_invert"
+  [[:by-value [:struct [[:r :uint8] [:g :uint8] [:b :uint8] [:a :uint8]]]]]
+  [:by-value [:struct [[:r :uint8] [:g :uint8] [:b :uint8] [:a :uint8]]]])
+(ffi/defcfn vector2-add "probe_vector2_add"
+  [[:by-value [:struct [[:x :float] [:y :float]]]] [:by-value [:struct [[:x :float] [:y :float]]]]]
+  [:by-value [:struct [[:x :float] [:y :float]]]])
+(ffi/defcfn rectangle-area "probe_rectangle_area"
+  [[:by-value [:struct [[:x :float] [:y :float] [:width :float] [:height :float]]]]] :float)
+(ffi/defcfn touch-position "probe_touch_position"
+  [:int] [:by-value [:struct [[:x :float] [:y :float]]]])
+(ffi/defcfn camera-zoom "probe_camera_zoom"
+  [[:by-value [:struct [[:offset [:struct [[:x :float] [:y :float]]]]
+                        [:target [:struct [[:x :float] [:y :float]]]]
+                        [:rotation :float] [:zoom :float]]]]] :float)
+
+(defn- put! [p l & kvs] (doseq [[k v] (partition 2 kvs)] (ffi/write-field p l k v)) p)
+(defn- v2 [p] [(ffi/read-field p vec2-l :x) (ffi/read-field p vec2-l :y)])
+
+(defn- check [name got expect]
+  (println (format "  %-34s %s   got %s, expected %s" name (if (= got expect) "PASS" "FAIL") (pr-str got) (pr-str expect)))
+  (= got expect))
+
+(defn -main [& _]
+  (println "probe:" (System/getProperty "os.arch") "— structs by value")
+  (let [results
+        [(ffi/with-layout [in color-l]
+           (ffi/with-layout [out color-l]
+             (put! in color-l :r 10 :g 20 :b 30 :a 255)
+             (color-invert out in)
+             (check "Color 4 B, in and out" (mapv #(ffi/read-field out color-l %) [:r :g :b :a]) [245 235 225 255])))
+         (ffi/with-layout [a vec2-l]
+           (ffi/with-layout [b vec2-l]
+             (ffi/with-layout [out vec2-l]
+               (put! a vec2-l :x 1.5 :y 2.25)
+               (put! b vec2-l :x 0.25 :y 1.5)
+               (vector2-add out a b)
+               (check "Vector2 8 B HFA, two in, one out" (v2 out) [1.75 3.75]))))
+         (ffi/with-layout [r rect-l]
+           (put! r rect-l :x 0.0 :y 0.0 :width 3.0 :height 4.5)
+           (check "Rectangle 16 B HFA, in" (rectangle-area r) 13.5))
+         (ffi/with-layout [out vec2-l]
+           (touch-position out 2)
+           (check "Vector2 returned, no struct in" (v2 out) [25.0 34.25]))
+         (ffi/with-layout [c camera-l]
+           (put! c camera-l [:offset :x] 0.5 [:offset :y] 0.0 [:target :x] 0.0 [:target :y] 0.0 :rotation 0.0 :zoom 2.5)
+           (check "Camera2D 24 B, indirect, nested" (camera-zoom c) 3.0))]]
+    (println (format "probe: %d/%d pass" (count (filter true? results)) (count results)))))
+#+end_src
+
+** Building it in
+
+=scripts/bundle= knows the two packs; this borrows its =case= rather than
+growing a knob. Two link-line details that are the whole reason the script
+exists: the object is passed *as an object*, not as =-lprobe= — an archive
+member nobody in C references is dropped by the linker, and Chez's lookup
+happens at run time, after linking is over; and =-Wl,-export_dynamic= keeps
+the executable's own globals in its export trie, where =dlsym= can find them.
+RAY-007 needed =--export-dynamic= for the same reason on Android.
+
+#+begin_src sh :tangle ../../scripts/probe :mkdirp true :comments link
+# jolt probe: examples/flappy milestone 0 — by-value structs, TARGET=sim|device.
+# Builds src/probe/by_value.c for the target, links it INTO the jolt executable,
+# and writes Hello.app/Hello. Then: jolt install && jolt console  |  jolt device
+set -eu
+TARGET="${TARGET:-sim}"
+EXTRA=""
+case "$TARGET" in
+  sim)    MACHINE=tarm64ios; PACK="$HOME/dev/pack-tarm64ios-sim"
+          ARCH="-target arm64-apple-ios-simulator -isysroot $(xcrun -sdk iphonesimulator --show-sdk-path)" ;;
+  device) MACHINE=tpb64l;    PACK="$HOME/dev/pack-tpb64l-ios"; EXTRA="-lffi"
+          ARCH="-target arm64-apple-ios14.0 -isysroot $(xcrun -sdk iphoneos --show-sdk-path)" ;;
+  *) echo "TARGET must be sim or device" >&2; exit 2 ;;
+esac
+T=$(mktemp -d)
+clang $ARCH -O2 -c src/probe/by_value.c -o "$T/by_value.o"
+mkdir -p Hello.app
+JOLT_TARGET_CC=clang \
+JOLT_TARGET_ARCH_FLAG="$ARCH" \
+JOLT_TARGET_LINK_LIBS="$T/by_value.o -Wl,-export_dynamic -L$PACK/lib -llz4 -lz $EXTRA -framework Foundation -liconv -lm" \
+  jolt build -m probe.core -o Hello.app/Hello --target "$MACHINE" --target-pack "$PACK"
+rm -rf Hello.app/Hello.build Hello.app/_CodeSignature Hello.app/embedded.mobileprovision "$T"
+#+end_src
+
+** Met, both sides
+
+The control first — the simulator, native Chez emitting its own stubs:
+
+#+begin_example
+$ TARGET=sim sh scripts/probe && jolt install && jolt console
+probe: aarch64 — structs by value
+  Color 4 B, in and out              PASS   got [245 235 225 255], expected [245 235 225 255]
+  Vector2 8 B HFA, two in, one out   PASS   got [1.75 3.75], expected [1.75 3.75]
+  Rectangle 16 B HFA, in             PASS   got 13.5, expected 13.5
+  Vector2 returned, no struct in     PASS   got [25.0 34.25], expected [25.0 34.25]
+  Camera2D 24 B, indirect, nested    PASS   got 3.0, expected 3.0
+probe: 5/5 pass
+#+end_example
+
+Then the question — the iPhone 16 Pro, portable bytecode, every call an
+=ffi_call= with a libffi-described aggregate:
+
+#+begin_example
+$ TARGET=device sh scripts/probe && jolt device
+probe: tpb64l — structs by value
+  Color 4 B, in and out              PASS   got [245 235 225 255], expected [245 235 225 255]
+  Vector2 8 B HFA, two in, one out   PASS   got [1.75 3.75], expected [1.75 3.75]
+  Rectangle 16 B HFA, in             PASS   got 13.5, expected 13.5
+  Vector2 returned, no struct in     PASS   got [25.0 34.25], expected [25.0 34.25]
+  Camera2D 24 B, indirect, nested    PASS   got 3.0, expected 3.0
+probe: 5/5 pass
+The app terminated with the exit code 0.
+#+end_example
+
+Same five lines, one word different. So the aggregate ABI RAY-010 deferred and
+RAY-012 had to earn on Android is simply /present/ here: libffi's arm64 port
+classifies HFAs and the over-16-byte indirect case the same way Chez's native
+code generator does, and jolt's =[:by-value …]= sits on top of both without
+caring which. Nothing in raylib's signature vocabulary is off the table on the
+phone — =GetTouchPosition= included, which is milestone 3's whole input model.
+
+Two smaller findings from the build rather than the run, both already in the
+script and kept here so they are not re-learned: an object in a static archive
+that no C code references is /dropped/ before Chez ever asks for it (raylib
+proper will be referenced from nowhere either — milestone 1 links it with
+=-force_load=, or as objects); and without =-Wl,-export_dynamic= an
+executable's own globals are not in the export trie, so =dlsym= — which is
+what a =defcfn= becomes at first call — cannot see them. RAY-007's
+=--export-dynamic= was the same discovery on the other platform.
+
+(One that was not learned the hard way, for once: the phone was locked for the
+first launch, and =devicectl= says so plainly — "the device was not, or could
+not be, unlocked" — rather than failing somewhere deeper.)
+
+* Milestone 1: SDL and raylib, static, in the pack (2026-08-31)
+
+Assembly before behaviour, RAY-002's rule: two static archives for the
+simulator, into the target pack beside =liblz4.a= and =libz.a=, linked into a
+jolt executable that calls one function from each. No window yet — that is
+milestone 2, where the loop meets =UIApplicationMain=. =cmake= joined the
+Brewfile for this.
+
+** SDL2, in two minutes
+
+SDL 2.32.10 from its release tarball, CMake's own iOS support, static only,
+and every subsystem that would drag a framework this example does not need
+turned off — audio, haptics, HIDAPI, joysticks, sensors. Video, events, timers
+and the file system are what raylib's platform layer asks for.
+
+#+begin_example
+cd ~/dev && curl -sfL https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz | tar xz && mv SDL2-2.32.10 SDL2
+cd SDL2 && cmake -S . -B build-ios-sim -G "Unix Makefiles" \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/dev/sdl2-ios-sim \
+  -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF -DSDL_TESTS=OFF \
+  -DSDL_AUDIO=OFF -DSDL_HAPTIC=OFF -DSDL_HIDAPI=OFF -DSDL_JOYSTICK=ON -DSDL_SENSOR=OFF   # JOYSTICK=ON: see milestone 2
+cmake --build build-ios-sim -j8 && cmake --install build-ios-sim      # lib/libSDL2.a, 1.8 MB, + SDL2Config.cmake
+#+end_example
+
+The only noise: every GLES call "deprecated: first deprecated in iOS 12.0".
+Deprecated is not removed; the simulator's iOS 26.5 still ships it.
+
+** raylib 6.0, in three tries
+
+=PLATFORM=SDL=, =GRAPHICS_API_OPENGL_ES2=, static, no examples. Three things
+stood in the way, none of them raylib's C:
+
+- *CMake's cross-compile find root.* With =CMAKE_SYSTEM_NAME=iOS=,
+  =find_package= searches /only the sysroot/ and ignores =CMAKE_PREFIX_PATH=;
+  SDL2's config directory has to be named (=SDL2_DIR=) and the find root
+  widened (=CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH=).
+- *Widening it found the wrong SDL.* raylib prefers SDL3 when it can find one,
+  and Homebrew has a macOS SDL3 on this machine — "Found SDL3 via
+  find_package()", for an iOS build. =CMAKE_DISABLE_FIND_PACKAGE_SDL3=ON=.
+- *Audio is not =USE_AUDIO=.* That option only gates a backend link on some
+  platforms; the module switch is =SUPPORT_MODULE_RAUDIO=OFF= under
+  =CUSTOMIZE_BUILD=ON=. Without it =raudio.c= compiles miniaudio, which on
+  =TARGET_OS_IPHONE= includes =AVFoundation.h= — Objective-C headers in a C
+  translation unit, forty errors deep in =NSObjCRuntime.h=. Audio on iOS means
+  compiling =raudio.c= as Objective-C; a later milestone, if ever.
+
+And one thing that did /not/ stand in the way, read before building: on
+=PLATFORM_DESKTOP_SDL= with ES2, rlgl uses its own =glad_gles2= loader through
+=SDL_GL_GetProcAddress= rather than the platform's GL headers — so the
+=OpenGLES= framework is a link- and run-time matter only, and the SDL branch of
+raylib's CMake has no macOS special cases at all.
+
+#+begin_example
+cd ~/dev && curl -sfL https://github.com/raysan5/raylib/archive/refs/tags/6.0.tar.gz | tar xz && mv raylib-6.0 raylib
+cd raylib && cmake -S . -B build-ios-sim -G "Unix Makefiles" \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/dev/raylib-ios-sim \
+  -DCMAKE_FIND_ROOT_PATH=$HOME/dev/sdl2-ios-sim -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH -DSDL2_DIR=$HOME/dev/sdl2-ios-sim/lib/cmake/SDL2 \
+  -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON \
+  -DPLATFORM=SDL -DGRAPHICS=GRAPHICS_API_OPENGL_ES2 -DBUILD_SHARED_LIBS=OFF -DBUILD_EXAMPLES=OFF \
+  -DCUSTOMIZE_BUILD=ON -DSUPPORT_MODULE_RAUDIO=OFF \
+  -DSUPPORT_CUSTOM_FRAME_CONTROL=OFF -DSUPPORT_BUSY_WAIT_LOOP=OFF      # CUSTOMIZE_BUILD turns these ON: see milestone 2
+cmake --build build-ios-sim -j8 && cmake --install build-ios-sim      # lib/libraylib.a, 1.3 MB, platform 7, minos 14.0
+cp ~/dev/sdl2-ios-sim/lib/libSDL2.a ~/dev/raylib-ios-sim/lib/libraylib.a ~/dev/pack-tarm64ios-sim/lib/
+#+end_example
+
+** The link probe
+
+Two calls, one per archive, neither needing a window: =SDL_GetPlatform= —
+which should say =iOS=, the =os.name= this runtime never learned — and
+=SDL_GetVersion= into a three-byte struct; then raylib's =GetRandomValue=.
+Both archives are =-force_load='d: nothing in C references them, and milestone
+0 found what the linker does to an unreferenced archive member. The framework
+list comes from the archive itself — =nm -u libSDL2.a= names the Objective-C
+classes it wants, and each class names its framework.
+
+#+begin_src clojure :tangle ../../src/raylib/link.clj :mkdirp true :comments link
+(ns raylib.link
+  "examples/flappy milestone 1: are SDL2 and raylib linked in? One call each,
+  no window: this proves the archives, the frameworks and the export trie."
+  (:require [jolt.ffi :as ffi]))
+
+(ffi/defcfn sdl-get-platform "SDL_GetPlatform" [] :string)
+(ffi/defcfn sdl-get-version  "SDL_GetVersion"  [:pointer] :void)      ; SDL_version {u8 major, minor, patch}
+(ffi/defcfn get-random-value "GetRandomValue"  [:int :int] :int)
+(ffi/defcfn set-random-seed  "SetRandomSeed"   [:uint] :void)
+
+(defn -main [& _]
+  (ffi/with-alloc [v 4]
+    (sdl-get-version v)
+    (println "link: SDL" (str (ffi/read v :uint8 0) "." (ffi/read v :uint8 1) "." (ffi/read v :uint8 2))
+             "on" (sdl-get-platform)))
+  (set-random-seed 7)
+  (println "link: raylib GetRandomValue(1, 6) =" (get-random-value 1 6)
+           "— os.arch" (System/getProperty "os.arch")))
+#+end_src
+
+#+begin_src sh :tangle ../../scripts/raylib :mkdirp true :comments link
+# jolt raylib: examples/flappy — build NS (default raylib.link) with SDL2 and
+# raylib linked in from the pack, TARGET=sim|device. Then: jolt install && jolt console
+set -eu
+NS="${NS:-raylib.link}"
+TARGET="${TARGET:-sim}"
+EXTRA=""
+case "$TARGET" in
+  sim)    MACHINE=tarm64ios; PACK="$HOME/dev/pack-tarm64ios-sim"
+          ARCH="-target arm64-apple-ios-simulator -isysroot $(xcrun -sdk iphonesimulator --show-sdk-path)" ;;
+  device) MACHINE=tpb64l;    PACK="$HOME/dev/pack-tpb64l-ios"; EXTRA="-lffi"
+          ARCH="-target arm64-apple-ios14.0 -isysroot $(xcrun -sdk iphoneos --show-sdk-path)" ;;
+  *) echo "TARGET must be sim or device" >&2; exit 2 ;;
+esac
+# the frameworks SDL2's objects reference (nm -u libSDL2.a), plus OpenGLES for raylib's GLES2 context;
+# CoreHaptics/CoreMotion/GameController are the joystick driver's (milestone 2: raylib asks SDL_Init for game controllers)
+FRAMEWORKS="-framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework OpenGLES -framework Metal -framework CoreVideo -framework AVFoundation -framework CoreMotion -framework GameController -framework CoreHaptics"
+mkdir -p Hello.app
+JOLT_TARGET_CC=clang \
+JOLT_TARGET_ARCH_FLAG="$ARCH" \
+JOLT_TARGET_LINK_LIBS="-Wl,-force_load,$PACK/lib/libSDL2.a -Wl,-force_load,$PACK/lib/libraylib.a -Wl,-export_dynamic -L$PACK/lib -llz4 -lz $EXTRA $FRAMEWORKS -lobjc -liconv -lm" \
+  jolt build -m "$NS" -o Hello.app/Hello --target "$MACHINE" --target-pack "$PACK"
+rm -rf Hello.app/Hello.build Hello.app/_CodeSignature Hello.app/embedded.mobileprovision
+#+end_src
+
+** Met, first link
+
+#+begin_example
+$ nm -u ~/dev/pack-tarm64ios-sim/lib/libSDL2.a | grep -o 'OBJC_CLASS_\$_[A-Za-z]*' | sort -u
+CADisplayLink CAEAGLLayer CAMetalLayer EAGLContext GCKeyboard GCMouse MTLRenderPassDescriptor …
+UIAlertController UIApplication UIDevice UIPasteboard UIScreen UITextField UIView UIWindow …
+$ TARGET=sim sh scripts/raylib && jolt install && jolt console
+jolt build: wrote ./Hello.app/Hello                       (26.9 MB: both archives, whole)
+link: SDL 2.32.10 on iOS
+link: raylib GetRandomValue(1, 6) = 1 — os.arch aarch64
+#+end_example
+
+No undefined symbols on the first attempt, because the framework list was read
+off the archive rather than guessed: =CAEAGLLayer= and =CADisplayLink= are
+QuartzCore, =EAGLContext= is OpenGLES, the =MTL*= descriptors are Metal, and
+=GCKeyboard=/=GCMouse= are GameController — referenced by SDL's keyboard and
+mouse support even with joysticks compiled out. raylib itself wants nothing
+beyond libc and libm.
+
+One line worth the milestone on its own: =SDL_GetPlatform= says *iOS*. The
+runtime underneath still reports =os.name= "Linux" (milestone 1 of the main
+notebook); SDL, linked into the same process, knows exactly where it is.
+
+Untried here, on purpose: the device. The archives above are simulator-only
+(=platform 7=); the phone wants the same two CMake runs with the =iphoneos=
+sysroot into =pack-tpb64l-ios=, which is milestone 5's business — nothing in
+this milestone's findings is simulator-specific, and the by-value probe
+already made the =pb= trip.
+
+* Milestone 2: the loop meets UIApplicationMain (2026-08-31)
+
+The first real unknown. Read from SDL's source before writing anything:
+
+- =SDL_UIKitRunApp(argc, argv, main_fn)= stores =main_fn=, then calls
+  =UIApplicationMain= with =SDLUIKitDelegate=. The delegate's
+  =postFinishLaunch= turns the event pump on and calls =main_fn= — on the main
+  thread, inside the run loop — and when it returns it deliberately does
+  /not/ =exit= ("to support applications that do setup in their main function
+  and then allow the Cocoa event loop to run").
+- The pump, =UIKit_PumpEvents=, spins =CFRunLoopRunInMode= until nothing is
+  pending. That is what makes a /blocking/ loop legal on iOS: every
+  =EndDrawing= → =PollInputEvents= → =SDL_PumpEvents= gives UIKit its turn.
+  RAY-009's shape — jolt owns the =while= — survives.
+- raylib's =InitPlatform= asks =SDL_Init= for =VIDEO | TIMER | EVENTS |
+  GAMECONTROLLER=. Game controllers imply joysticks, which milestone 1 had
+  compiled out; =SDL_Init= would have failed and =InitWindow= bailed before
+  the first frame. SDL is rebuilt with =SDL_JOYSTICK=ON= (HIDAPI still off,
+  so no CoreBluetooth), which brings CoreHaptics, CoreMotion and
+  GameController onto the link line — the recipe and =scripts/raylib= above
+  say so now.
+- =InitWindow(w, h)= /is/ raylib's screen size; SDL on iOS makes the window
+  full-screen whatever is asked, so asking for the display's own size is the
+  honest request. =SDL_GetCurrentDisplayMode= answers before there is a
+  window (its =SDL_Init= is reference-counted; raylib's second call is free).
+
+So the shape is =screen.core= again: a =:blocking= call into UIKit's loop, a
+=:collect-safe= foreign-callable that UIKit calls back into — except this
+time the callable never returns, because it /is/ the program. =EndDrawing=
+is declared =:blocking= too: it waits for vsync, and a wait the runtime can
+see does not pin the collector for sixteen milliseconds a frame.
+
+Colours travel as raylib-jlt's packed =:uint= (=r | g<<8 | b<<16 | a<<24=): a
+4-byte struct and a =uint32= occupy one register identically, and milestone 0
+says =[:by-value …]= is there when a real struct is needed.
+
+#+begin_src clojure :tangle ../../src/raylib/window.clj :mkdirp true :comments link
+(ns raylib.window
+  "examples/flappy milestone 2: raylib's loop inside UIApplicationMain.
+  SDL_UIKitRunApp is called :blocking with a :collect-safe foreign-callable as
+  SDL_main; that callable runs InitWindow and the whole while loop, on the main
+  thread, inside SDL's app delegate, for the life of the app."
+  (:require [glimmer-ios.ffi :as u]          ; cls/sel/nsstring->str, for the UIKit diagnostics
+            [jolt.ffi :as ffi]))
+
+;; --- SDL: the entry, and the display size before there is a window ----------
+(ffi/defcfn sdl-uikit-run-app          "SDL_UIKitRunApp"          [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn sdl-init                   "SDL_Init"                 [:uint32] :int)
+(ffi/defcfn sdl-get-current-display-mode "SDL_GetCurrentDisplayMode" [:int :pointer] :int)
+(ffi/defcfn sdl-get-error              "SDL_GetError"             [] :string)
+(def ^:private SDL-INIT-VIDEO 0x20)
+
+;; --- raylib: the subset raylib-jlt's core example uses -----------------------
+(ffi/defcfn init-window         "InitWindow"        [:int :int :string] :void)
+(ffi/defcfn window-should-close "WindowShouldClose" [] :uint8)              ; C bool
+(ffi/defcfn close-window        "CloseWindow"       [] :void)
+(ffi/defcfn set-target-fps      "SetTargetFPS"      [:int] :void)
+(ffi/defcfn begin-drawing       "BeginDrawing"      [] :void)
+(ffi/defcfn end-drawing         "EndDrawing"        [] :void)               ; NOT :blocking — see "The :blocking void call"
+(ffi/defcfn clear-background    "ClearBackground"   [:uint] :void)
+(ffi/defcfn draw-text           "DrawText"          [:string :int :int :int :uint] :void)
+(ffi/defcfn draw-circle         "DrawCircle"        [:int :int :float :uint] :void)
+(ffi/defcfn get-screen-width    "GetScreenWidth"    [] :int)
+(ffi/defcfn get-screen-height   "GetScreenHeight"   [] :int)
+(ffi/defcfn get-render-width    "GetRenderWidth"    [] :int)
+(ffi/defcfn get-render-height   "GetRenderHeight"   [] :int)
+(ffi/defcfn get-frame-time      "GetFrameTime"      [] :float)
+(ffi/defcfn get-fps             "GetFPS"            [] :int)
+(ffi/defcfn get-time            "GetTime"           [] :double)
+;; timing diagnostics, for the first run's "0 fps, dt 0.0"
+(ffi/defcfn sdl-get-ticks                 "SDL_GetTicks"                 [] :uint32)
+(ffi/defcfn sdl-get-performance-counter   "SDL_GetPerformanceCounter"   [] :uint64)
+(ffi/defcfn sdl-get-performance-frequency "SDL_GetPerformanceFrequency" [] :uint64)
+
+;; first-run diagnostics: a black screen at 7000 fps
+(ffi/defcfn sdl-gl-get-current-context "SDL_GL_GetCurrentContext" [] :pointer)
+(ffi/defcfn sdl-gl-get-swap-interval   "SDL_GL_GetSwapInterval"   [] :int)
+(ffi/defcfn gl-get-error               "glGetError"               [] :uint)
+(ffi/defcfn is-window-ready            "IsWindowReady"            [] :uint8)
+(ffi/defcfn is-window-hidden           "IsWindowHidden"           [] :uint8)
+(ffi/defcfn is-window-focused          "IsWindowFocused"          [] :uint8)
+(ffi/defcfn is-window-minimized        "IsWindowMinimized"        [] :uint8)
+
+(ffi/defcfn sdl-gl-get-current-window "SDL_GL_GetCurrentWindow" [] :pointer)   ; before its first use: jolt resolves top-down
+(ffi/defcfn sdl-gl-get-drawable-size "SDL_GL_GetDrawableSize" [:pointer :pointer :pointer] :void)
+(ffi/defcfn gl-bind-renderbuffer     "glBindRenderbuffer"     [:uint :uint] :void)
+(def ^:private GL-RENDERBUFFER 0x8D41)
+
+(defn- windows-description
+  "[[[UIApplication sharedApplication].windows firstObject] recursiveDescription]
+  — the whole view hierarchy of SDL's window: frames, hidden/alpha, layer classes."
+  []
+  (u/nsstring->str
+    (u/objc-msg-send-0
+      (u/objc-msg-send-0
+        (u/objc-msg-send-0 (u/objc-msg-send-0 (u/cls "UIApplication") (u/sel "sharedApplication")) (u/sel "windows"))
+        (u/sel "firstObject"))
+      (u/sel "recursiveDescription"))))
+
+;; are pixels landing in the FBO at all? flush raylib's batch, then read two pixels
+(ffi/defcfn rl-draw-render-batch-active "rlDrawRenderBatchActive" [] :void)
+(ffi/defcfn gl-read-pixels "glReadPixels" [:int :int :int :int :uint :uint :pointer] :void)
+(defn- read-pixel [x y]
+  (ffi/with-alloc [p 4]
+    (gl-read-pixels x y 1 1 0x1908 0x1401 p)                      ; GL_RGBA, GL_UNSIGNED_BYTE
+    (mapv #(ffi/read p :uint8 %) [0 1 2 3])))
+(defn- probe-pixels! [frame]
+  (rl-draw-render-batch-active)
+  (println "diag: frame" frame "pixels — center" (read-pixel (quot (get-screen-width) 2) (quot (get-screen-height) 2))
+           "(maroon 190 33 55) corner" (read-pixel 2 2) "(raywhite 245 245 245)"))
+
+(defn- diagnose! [frame]
+  (ffi/with-alloc [w 4] (ffi/with-alloc [h 4]
+    (sdl-gl-get-drawable-size (sdl-gl-get-current-window) w h)
+    (println "diag: drawable" (ffi/read w :int 0) "x" (ffi/read h :int 0))))
+  (println "diag: windows" (windows-description))
+  (println "diag: frame" frame
+           "| GetTime" (get-time) "GetFrameTime" (pr-str (get-frame-time))
+           "| SDL ticks" (sdl-get-ticks) "perf" (sdl-get-performance-counter) "/" (sdl-get-performance-frequency)
+           "| GL ctx" (sdl-gl-get-current-context) "swap-interval" (sdl-gl-get-swap-interval) "glGetError" (gl-get-error)
+           "| ready" (is-window-ready) "hidden" (is-window-hidden) "focused" (is-window-focused) "minimized" (is-window-minimized)
+           "| SDL_GetError:" (pr-str (sdl-get-error))))
+
+;; --- iOS has no default framebuffer: SDL's view FBO must be bound to draw on screen
+(ffi/defcfn sdl-get-window-wm-info    "SDL_GetWindowWMInfo"    [:pointer :pointer] :int)   ; SDL_bool
+(ffi/defcfn gl-bind-framebuffer       "glBindFramebuffer"      [:uint :uint] :void)
+(def ^:private GL-FRAMEBUFFER 0x8D40)
+
+(defn- view-framebuffer
+  "SDL's drawable FBO for the current window, via SDL_SysWMinfo:
+  {SDL_version version(3 B); int subsystem @4; union @8: {UIWindow *window @8;
+  GLuint framebuffer @16; GLuint colorbuffer @20; GLuint resolveFramebuffer @24}}.
+  The version must be filled in before the call, or SDL refuses."
+  []
+  (ffi/with-alloc [info 128]
+    (dotimes [i 128] (ffi/write info :uint8 i 0))
+    (ffi/write info :uint8 0 2) (ffi/write info :uint8 1 32) (ffi/write info :uint8 2 10)   ; SDL 2.32.10
+    (if (pos? (sdl-get-window-wm-info (sdl-gl-get-current-window) info))
+      {:subsystem (ffi/read info :int 4) :framebuffer (ffi/read info :uint32 16) :colorbuffer (ffi/read info :uint32 20)}
+      (do (println "window: SDL_GetWindowWMInfo failed:" (sdl-get-error)) nil))))
+
+(defn rgba [r g b a] (bit-or r (bit-shift-left g 8) (bit-shift-left b 16) (bit-shift-left a 24)))
+(def RAYWHITE (rgba 245 245 245 255))
+(def DARKGRAY (rgba 80 80 80 255))
+(def MAROON   (rgba 190 33 55 255))
+
+(defn- display-size
+  "[w h] of display 0, from SDL, before any window exists."
+  []
+  (when (neg? (sdl-init SDL-INIT-VIDEO)) (println "window: SDL_Init failed:" (sdl-get-error)))
+  (ffi/with-alloc [m 24]                    ; SDL_DisplayMode {u32 format; int w, h, refresh_rate; void *driverdata}
+    (if (zero? (sdl-get-current-display-mode 0 m))
+      [(ffi/read m :int 4) (ffi/read m :int 8)]
+      (do (println "window: no display mode:" (sdl-get-error)) [390 844]))))
+
+(defn- sdl-main
+  "SDL_main: the main thread, inside UIApplicationMain, event pump on. Owns the
+  raylib loop for the life of the app (RAY-009's shape)."
+  [_argc _argv]
+  (let [[w h] (display-size)]
+    (println "window: display" w "x" h "— InitWindow")
+    (init-window w h "flappy")
+    (set-target-fps 60)
+    (println "window: screen" (get-screen-width) "x" (get-screen-height)
+             "render" (get-render-width) "x" (get-render-height))
+    (let [{:keys [framebuffer colorbuffer] :as wm} (view-framebuffer)]
+      (println "window: SDL view framebuffer" wm)
+      (loop [frame 0]
+        (begin-drawing)
+        (when framebuffer (gl-bind-framebuffer GL-FRAMEBUFFER framebuffer))   ; iOS: no FBO 0
+        (clear-background RAYWHITE)
+      (draw-text "hello from jolt + raylib" 24 120 20 DARKGRAY)
+      (draw-text (str "frame " frame "  " (get-fps) " fps") 24 160 20 DARKGRAY)
+      (draw-circle (quot (get-screen-width) 2) (quot (get-screen-height) 2) 40.0 MAROON)
+      (when (= frame 60) (probe-pixels! frame))
+      (when colorbuffer (gl-bind-renderbuffer GL-RENDERBUFFER colorbuffer))   ; iOS: bound at swap
+      (end-drawing)
+      (when (or (= frame 1) (= frame 60) (= frame 600)) (diagnose! frame))
+      (when (zero? (mod frame 3000))
+        (println "window: frame" frame "at" (get-fps) "fps, dt" (get-frame-time)))
+      (if (pos? (window-should-close))
+        (do (close-window) 0)
+        (recur (inc frame)))))))
+
+(defonce ^:private sdl-main-cb
+  (ffi/foreign-callable sdl-main [:int :pointer] :int :collect-safe))
+
+(defn -main [& _]
+  (println "window: entering SDL_UIKitRunApp")
+  (ffi/with-c-string-array [argv 1] ["Hello"]
+    (sdl-uikit-run-app 1 argv sdl-main-cb)))
+#+end_src
+
+#+begin_example
+NS=raylib.window TARGET=sim sh scripts/raylib && jolt install && jolt console
+#+end_example
+
+** Four findings on the way to a frame
+
+The first run drew nothing and reported 82,500 frames in twelve seconds at
+"0 fps, dt 0.0". Four separate things were wrong, found in this order, each
+one uncovering the next.
+
+*=CUSTOMIZE_BUILD= turns the disabled options on.* raylib's =config.h= spells
+a disabled option =#define SUPPORT_X 0 // Disabled by default=, and the parser
+behind =CUSTOMIZE_BUILD=ON= reads any =#define SUPPORT_*= as ON, value
+ignored. So =SUPPORT_CUSTOM_FRAME_CONTROL= was on — under which =EndDrawing=
+does no swap, no timing and no event poll, and =GetFPS= returns a literal 0 —
+and =SUPPORT_BUSY_WAIT_LOOP= with it. (The other casualties are a dozen image
+formats and GPU skinning: bloat, not behaviour.) Both are explicit =OFF= in
+the recipe now; a =GetTime= that advanced while =GetFrameTime= stayed 0.0 was
+the tell.
+
+*The console is a leash, again, and SDL makes it polite.* With polling
+restored the loop ran at 60 fps for exactly as long as =simctl launch
+--console= was attached: ending the console signals the app, SDL's signal
+handler posts =SDL_QUIT=, raylib sets =shouldClose=, and the loop closed the
+window and returned — after which SDL's delegate, true to its comment, did
+not exit, and left a black window behind. Milestone 3 of the main notebook
+found the same leash; this time it looked like a rendering bug for an hour.
+
+*iOS has no default framebuffer.* SDL's =README-ios= says it in one line: the
+drawable FBO "must be bound while rendering to the screen and when
+=SDL_GL_SwapWindow()= is called", and the colour renderbuffer too. raylib's SDL
+platform never binds either, so it draws into framebuffer 0 — which the
+simulator's GLES obligingly treats as a valid, invisible framebuffer, and a
+device would reject. The ids come out of =SDL_SysWMinfo= (=uikit.framebuffer=,
+=uikit.colorbuffer=; the struct's =version= must be filled in first) and are
+bound every frame. Worth an issue upstream: =rcore_desktop_sdl.c= is one
+=SDL_GetWindowWMInfo= away from iOS.
+
+*The simulator no longer shows OpenGL ES at all.* With all three fixed the
+frame was provably there — a =glReadPixels= after flushing the batch read the
+maroon circle at the centre and =RAYWHITE= in the corner — and the screen
+stayed black. The view hierarchy was exactly right (one =SDL_uikitwindow=, an
+=SDL_uikitopenglview= with a =CAEAGLLayer=, full frame, not hidden). This is
+Apple's, and known: from the iOS 17.5 simulator on, EAGL apps present black
+or exit — SDL2 is named specifically — while the same build renders on
+hardware ([[https://developer.apple.com/forums/thread/803483][forums.developer.apple.com/thread/803483]]; the iOS 16 beta broke
+=presentRenderbuffer= the same way, [[https://forums.developer.apple.com/forums/thread/707644][thread 707644]], [[https://github.com/mousebird-consulting-inc/WhirlyGlobe/issues/1542][WhirlyGlobe#1542]]). OpenGL ES
+has been deprecated since iOS 12; the simulator is where the deprecation is
+now enforced by neglect.
+
+** Met — on the phone
+
+So the control for the simulator's black screen was the device, which meant
+building the two archives again with the =iphoneos= sysroot into
+=pack-tpb64l-ios= (the same two recipes, =-DCMAKE_OSX_SYSROOT=iphoneos=, into
+=sdl2-ios-dev= / =raylib-ios-dev=; =platform 2=), and =TARGET=device= in
+=scripts/raylib=:
+
+#+begin_example
+$ NS=raylib.window TARGET=device sh scripts/raylib && jolt device
+window: display 402 x 874 — InitWindow
+INFO:     > Renderer: Apple A18 Pro GPU
+INFO:     > Version:  OpenGL ES 2.0 Metal - 104.1
+window: SDL view framebuffer {:subsystem 5, :framebuffer 1, :colorbuffer 1}
+window: frame 0 at 53 fps, dt 0.567
+diag: frame 60 pixels — center [189 32 58 255] (maroon 190 33 55) corner [247 243 239 255] (raywhite 245 245 245)
+diag: frame 60 | GetTime 1.597 GetFrameTime 0.01712 | … glGetError 0 | ready 1 hidden 0 focused 1
+#+end_example
+
+And on the iPhone 16 Pro's screen: a light canvas, "hello from jolt +
+raylib", a frame counter climbing at 60 fps, a maroon circle. raylib's =while=
+loop, owned by jolt, inside =UIApplicationMain=, on portable bytecode with
+every draw call a libffi call — RAY-009's shape, on the other platform. The
+pixel probe's rounding (=189 32 58= for =190 33 55=) is a real GPU's, which the
+simulator's software renderer never showed.
+
+#+caption: Frame 393, 59 fps, on the iPhone 16 Pro — raylib's default font and a =DrawCircle=, drawn by a jolt loop on portable bytecode. The chunky pixels are honest too: the window is 402×874 at 1× and upscaled, because nobody asked for =FLAG_WINDOW_HIGHDPI= yet.
+[[file:../../media/raylib.png]]
+
+Open, and now a development-loop question rather than a correctness one: the
+simulator cannot show this. raylib 6.0 ships a software rasteriser
+(=OPENGL_VERSION=Software=, =rlsw=) whose SDL platform blits through
+=SDL_UpdateWindowSurface= — which on iOS SDL backs with a renderer texture,
+Metal first. That would give the simulator a picture without GLES, at CPU
+cost, for a 402×874 2D game. Untried; the phone is the target and it works.

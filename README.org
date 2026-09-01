@@ -475,6 +475,7 @@ brew "libimobiledevice"     # iproxy: a TCP port on the phone, over USB, for nRE
 brew "rlwrap"               # arrows + history for `jolt connect` (clj needs it too)
 brew "librsvg"              # rsvg-convert: the app icon from media/jolt.svg
 brew "imagemagick"          # crop, flatten and resize it
+brew "cmake"                # cross-builds SDL2 and raylib for the simulator and the phone (examples/flappy, milestone 1)
 #+end_src
 
 The =.gitignore= tangles from here too — it is toolchain residue, and the
@@ -1721,9 +1722,17 @@ done:
    pattern for a system prompt.
 6. *A clean-room verifier* — EXP-016's fail-fast check, over Brewfile +
    =jolt tangle= + =jolt test= + a simulator smoke.
+7. *raylib, and Flappy Bird* — a second renderer, as its own example:
+   [[file:examples/flappy/README.org][examples/flappy]]. The Android experiment's pure =flappy_bird.cljc=
+   unchanged, an iOS owner loop underneath; raylib static in the pack, SDL as
+   the platform layer raylib lacks. Research written 2026-08-31; nothing
+   tangles yet.
 
 Not on the list, on purpose: a gesture layer (raylib's touch work has no
 analogue when =UIButton= is the input), and a second UI shape.
+(2026-08-31, later: the second UI shape got onto the list after all — as
+item 7, and as a separate example rather than a change to this one. The
+gesture layer stays off it.)
 
 * References
 
