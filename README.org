@@ -566,7 +566,12 @@ the block above says =conf=, whose comment is =#=) leaves Emacs waiting on a
 once, from any Emacs.
 
 #+begin_src clojure :tangle deps.edn :comments link
-{:paths ["src"]
+{;; ffi/write took (p t offset v) before 0.8.0 and (p t v offset) after, and the
+ ;; two cannot be told apart at runtime — so an older jolt must refuse, not
+ ;; guess. Every struct here is a layout + write-field regardless (see "jolt
+ ;; 0.8.0: the write order"); the floor is belt and braces.
+ :jolt/min-version "0.8.0"
+ :paths ["src"]
  ;; Milestone 4: glimmer (the reactive core, no natives), hiccup (markup
  ;; serialization), spec (the registry) — pins match glimmer-uikit's. No
  ;; :jolt/native: UIKit is loaded from -main (see glimmer-ios/ffi.org).
@@ -1738,6 +1743,46 @@ listened on its layout-built =sockaddr= (nREPL answered), fetched through the
 layout-built block (=wire: rendered=) and redrew through the layout-built
 run-loop source; the phone's Flappy Bird found SDL's framebuffer (=fbo 1=)
 through the three-field version layout. Same bytes in memory, spelled by name.
+
+** Upgraded (2026-09-01, later)
+
+The tap moved the same day. =brew upgrade jolt=, =jolt --version= → 0.8.0,
+and the checklist: =jolt tangle= and =jolt test= (15 / 60) unchanged; the
+simulator's wire app listened on its layout-built =sockaddr=, fetched through
+the layout-built block and redrew (=wire: rendered=); Flappy Bird on the phone,
+rebuilt on 0.8.0, played — which is the host's version layout finding SDL's
+framebuffer, since without it the screen is black. =:jolt/min-version "0.8.0"=
+is in =deps.edn= now: an older jolt refuses rather than guesses.
+
+One hope did not survive the probe. The simulator still reports =os.name=
+"Linux", and =(jolt.nrepl/start 7999)= — tried live, over =demo.repl='s own
+listener — still dies with =socket() failed=. Reading the CHANGELOG line again,
+"a *portable-bytecode* build reported itself as Linux" is exactly what it
+says: =tpb64l= is fixed, =tarm64ios= is not — a native machine type that is
+neither =*osx= nor =*le= still falls through =sa-os-family=. So =demo.repl=
+keeps its socket on the simulator, and the upstream note below stands for
+the native iOS machine type. Whether the phone now says something other
+than "Linux" is a =hello.core= run away, and worth its own line when taken.
+
+** Upgraded (2026-09-01, later)
+
+The tap moved the same day. =brew upgrade jolt=, =jolt --version= → 0.8.0,
+and the checklist: =jolt tangle= and =jolt test= (15 / 60) unchanged; the
+simulator's wire app listened on its layout-built =sockaddr=, fetched through
+the layout-built block and redrew (=wire: rendered=); Flappy Bird on the phone,
+rebuilt on 0.8.0, played — which is the host's version layout finding SDL's
+framebuffer, since without it the screen is black. =:jolt/min-version "0.8.0"=
+is in =deps.edn= now: an older jolt refuses rather than guesses.
+
+One hope did not survive the probe. The simulator still reports =os.name=
+"Linux", and =(jolt.nrepl/start 7999)= — tried live, over =demo.repl='s own
+listener — still dies with =socket() failed=. Reading the CHANGELOG line again,
+"a *portable-bytecode* build reported itself as Linux" is exactly what it
+says: =tpb64l= is fixed, =tarm64ios= is not — a native machine type that is
+neither =*osx= nor =*le= still falls through =sa-os-family=. So =demo.repl=
+keeps its socket on the simulator, and the upstream note below stands for
+the native iOS machine type. Whether the phone now says something other
+than "Linux" is a =hello.core= run away, and worth its own line when taken.
 
 Three other 0.8.0 lines matter here. *A portable-bytecode build reported
 itself as Linux, wherever it was running* — that is milestone 1's =os.name=
