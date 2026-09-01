@@ -147,8 +147,10 @@ to =xcrun= and =iproxy=. Noted, not pursued.
    the animation callback.+ Met, 2026-09-01, on the iPhone — the blocking loop
    held at 60 fps; the simulator cannot display OpenGL ES any more (Apple's
    regression, sources in "Milestone 2"). Four findings on the way, all kept.
-3. *Touch*: RAY-010's scalar polling, the press edge, a marker under the
-   finger. Then =GetTouchPosition= by value, once milestone 0 has said yes.
+3. +*Touch*: RAY-010's scalar polling, the press edge, a marker under the
+   finger. Then =GetTouchPosition= by value, once milestone 0 has said yes.+
+   Met, 2026-09-01 — and the host (=raylib.host/run!=, a reducer over frames)
+   came out of it, plus the 3× render by hand; see "Milestone 3".
 4. *Flappy Bird*: =flappy_bird.cljc= from =6d2b291=, unchanged; an iOS owner
    loop of the RAY-018 shape; its 19 tests green under =jolt test=; the bird
    on the simulator, then the phone. The screenshot for the README.
@@ -797,3 +799,243 @@ simulator cannot show this. raylib 6.0 ships a software rasteriser
 =SDL_UpdateWindowSurface= — which on iOS SDL backs with a renderer texture,
 Metal first. That would give the simulator a picture without GLES, at CPU
 cost, for a 402×874 2D game. Untried; the phone is the target and it works.
+
+* Milestone 3: touch (2026-09-01)
+
+Two things read before writing, both from =rcore_desktop_sdl.c=:
+
+- =FLAG_WINDOW_HIGHDPI= "is not supported on PLATFORM_DESKTOP_SDL" — the flag
+  still asks SDL for =ALLOW_HIGHDPI= (a 3× drawable), but raylib then sets
+  =render = screen= and never scales. So the 3× render is done by hand: ask
+  =UIScreen= for its scale, ask =InitWindow= for the display size /in pixels/,
+  and SDL's always-fullscreen window makes the drawable match exactly. Screen
+  units are pixels from then on; touch coordinates come out in the same units,
+  because raylib scales SDL's normalised finger positions by the screen size.
+- raylib sets =SDL_HINT_TOUCH_MOUSE_EVENTS= to =0= and consumes =SDL_FINGER*=
+  itself: touch count, per-point ids, point-zero =GetTouchX=/=GetTouchY= — the
+  scalar surface RAY-010 built on. A /press edge/ is the touch count going
+  0 → 1 in the frame reducer, RAY-018's flap; =IsMouseButtonPressed= is not
+  the source here.
+
+The milestone-2 spike becomes a host: =raylib.host/run!= takes
+={:title :init :frame}= and owns everything iOS — =SDL_UIKitRunApp=, the
+callable, =InitWindow=, the FBO binding — and calls =(frame state)= between
+=BeginDrawing= and =EndDrawing=. The scene is a reducer over frames. That is
+RAY-018's owner-loop contract, and it is what =flappy_bird.cljc= will sit
+under unchanged.
+
+The simulator cannot show any of this, so the witness is the console, as it
+was logcat for RAY-010: every press edge prints its coordinates from both the
+scalar API and the by-value =GetTouchPosition= — milestone 0's promise, kept
+in production — and every release prints how many frames the finger held.
+
+#+begin_src clojure :tangle ../../src/raylib/host.clj :mkdirp true :comments link
+(ns raylib.host
+  "The iOS owner loop for raylib (RAY-018's shape). run! hands the app to
+  SDL_UIKitRunApp; a :collect-safe SDL_main then owns InitWindow and the
+  while loop — per frame: BeginDrawing, bind SDL's drawable FBO (iOS has no
+  framebuffer 0), (frame state) -> state', bind the colour renderbuffer,
+  EndDrawing. The screen is sized in PIXELS (UIScreen scale × points), since
+  raylib's SDL platform does not do HighDPI itself."
+  (:refer-clojure :exclude [run!])          ; run! is the entry point here, as in raylib-jlt
+  (:require [glimmer-ios.ffi :as u]
+            [jolt.ffi :as ffi]))
+
+;; --- SDL ---------------------------------------------------------------------
+(ffi/defcfn sdl-uikit-run-app            "SDL_UIKitRunApp"           [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn sdl-init                     "SDL_Init"                  [:uint32] :int)
+(ffi/defcfn sdl-get-current-display-mode "SDL_GetCurrentDisplayMode" [:int :pointer] :int)
+(ffi/defcfn sdl-get-error                "SDL_GetError"              [] :string)
+(ffi/defcfn sdl-gl-get-current-window    "SDL_GL_GetCurrentWindow"   [] :pointer)
+(ffi/defcfn sdl-get-window-wm-info       "SDL_GetWindowWMInfo"       [:pointer :pointer] :int)
+(ffi/defcfn sdl-gl-get-drawable-size     "SDL_GL_GetDrawableSize"    [:pointer :pointer :pointer] :void)
+(ffi/defcfn gl-bind-framebuffer          "glBindFramebuffer"         [:uint :uint] :void)
+(ffi/defcfn gl-bind-renderbuffer         "glBindRenderbuffer"        [:uint :uint] :void)
+(ffi/defcfn msg-0d                       "objc_msgSend"              [:pointer :pointer] :double)   ; [UIScreen scale]
+(def ^:private SDL-INIT-VIDEO 0x20)
+(def ^:private GL-FRAMEBUFFER 0x8D40)
+(def ^:private GL-RENDERBUFFER 0x8D41)
+
+;; --- raylib: window, frame, drawing (the raylib-jlt subset, packed :uint colours) ---
+(ffi/defcfn set-config-flags    "SetConfigFlags"    [:uint] :void)
+(ffi/defcfn init-window         "InitWindow"        [:int :int :string] :void)
+(ffi/defcfn window-should-close "WindowShouldClose" [] :uint8)
+(ffi/defcfn close-window        "CloseWindow"       [] :void)
+(ffi/defcfn set-target-fps      "SetTargetFPS"      [:int] :void)
+(ffi/defcfn begin-drawing       "BeginDrawing"      [] :void)
+(ffi/defcfn end-drawing         "EndDrawing"        [] :void)
+(ffi/defcfn clear-background    "ClearBackground"   [:uint] :void)
+(ffi/defcfn draw-text           "DrawText"          [:string :int :int :int :uint] :void)
+(ffi/defcfn draw-circle         "DrawCircle"        [:int :int :float :uint] :void)
+(ffi/defcfn draw-circle-lines   "DrawCircleLines"   [:int :int :float :uint] :void)
+(ffi/defcfn draw-rectangle      "DrawRectangle"     [:int :int :int :int :uint] :void)
+(ffi/defcfn draw-line           "DrawLine"          [:int :int :int :int :uint] :void)
+(ffi/defcfn get-screen-width    "GetScreenWidth"    [] :int)
+(ffi/defcfn get-screen-height   "GetScreenHeight"   [] :int)
+(ffi/defcfn get-frame-time      "GetFrameTime"      [] :float)
+(ffi/defcfn get-fps             "GetFPS"            [] :int)
+(def FLAG-WINDOW-HIGHDPI 0x2000)
+
+;; --- raylib: touch (RAY-010's scalar surface, plus the by-value Vector2) ----
+(ffi/defcfn get-touch-point-count "GetTouchPointCount" [] :int)
+(ffi/defcfn get-touch-point-id    "GetTouchPointId"    [:int] :int)
+(ffi/defcfn get-touch-x           "GetTouchX"          [] :int)
+(ffi/defcfn get-touch-y           "GetTouchY"          [] :int)
+(ffi/defcfn get-touch-position    "GetTouchPosition"   [:int] [:by-value [:struct [[:x :float] [:y :float]]]])
+(def ^:private vec2-l (ffi/layout [:struct [[:x :float] [:y :float]]]))
+(defn touch-position
+  "[x y] of touch point `i`, through the by-value Vector2 return."
+  [i]
+  (ffi/with-layout [v vec2-l]
+    (get-touch-position v i)
+    [(ffi/read-field v vec2-l :x) (ffi/read-field v vec2-l :y)]))
+
+(defn rgba [r g b a] (bit-or r (bit-shift-left g 8) (bit-shift-left b 16) (bit-shift-left a 24)))
+(def RAYWHITE  (rgba 245 245 245 255))
+(def LIGHTGRAY (rgba 200 200 200 255))
+(def DARKGRAY  (rgba 80 80 80 255))
+(def MAROON    (rgba 190 33 55 255))
+(def SKYBLUE   (rgba 102 191 255 255))
+
+;; --- the host ----------------------------------------------------------------
+(defn- display-points
+  "[w h] of display 0 in points, from SDL, before any window exists."
+  []
+  (when (neg? (sdl-init SDL-INIT-VIDEO)) (println "host: SDL_Init failed:" (sdl-get-error)))
+  (ffi/with-alloc [m 24]                    ; SDL_DisplayMode {u32 format; int w, h, refresh_rate; void *driverdata}
+    (if (zero? (sdl-get-current-display-mode 0 m))
+      [(ffi/read m :int 4) (ffi/read m :int 8)]
+      (do (println "host: no display mode:" (sdl-get-error)) [390 844]))))
+
+(defn- screen-scale [] (msg-0d (u/objc-msg-send-0 (u/cls "UIScreen") (u/sel "mainScreen")) (u/sel "scale")))
+
+(defn- view-framebuffer
+  "SDL's drawable FBO and colour renderbuffer for the current window, via
+  SDL_SysWMinfo (version @0, subsystem @4, uikit.framebuffer @16, colorbuffer @20)."
+  []
+  (ffi/with-alloc [info 128]
+    (dotimes [i 128] (ffi/write info :uint8 i 0))
+    (ffi/write info :uint8 0 2) (ffi/write info :uint8 1 32) (ffi/write info :uint8 2 10)   ; SDL 2.32.10
+    (if (pos? (sdl-get-window-wm-info (sdl-gl-get-current-window) info))
+      {:framebuffer (ffi/read info :uint32 16) :colorbuffer (ffi/read info :uint32 20)}
+      (do (println "host: SDL_GetWindowWMInfo failed:" (sdl-get-error)) {}))))
+
+(defonce ^:private app (atom nil))        ; {:title :init :frame :fps} — the callable is global, so this is how it finds the scene
+
+(defn- sdl-main
+  "SDL_main: the main thread, inside UIApplicationMain, event pump on. Sizes
+  the screen in pixels, then owns the loop for the life of the app."
+  [_argc _argv]
+  (let [{:keys [title init frame fps] :or {fps 60}} @app
+        [pw ph] (display-points)
+        k       (screen-scale)
+        w       (int (* pw k))
+        h       (int (* ph k))]
+    (set-config-flags FLAG-WINDOW-HIGHDPI)       ; SDL_WINDOW_ALLOW_HIGHDPI: a full-resolution drawable
+    (init-window w h title)                      ; ...and a screen the same size, so raylib never scales
+    (set-target-fps fps)
+    (let [{:keys [framebuffer colorbuffer]} (view-framebuffer)]
+      (ffi/with-alloc [dw 4]
+        (ffi/with-alloc [dh 4]
+          (sdl-gl-get-drawable-size (sdl-gl-get-current-window) dw dh)
+          (println "host:" pw "x" ph "points × scale" k "→ screen" (get-screen-width) "x" (get-screen-height)
+                   "drawable" (ffi/read dw :int 0) "x" (ffi/read dh :int 0) "fbo" framebuffer)))
+      (loop [state (init {:width w :height h :scale k})]
+        (begin-drawing)
+        (when framebuffer (gl-bind-framebuffer GL-FRAMEBUFFER framebuffer))
+        (let [state' (frame state)]
+          (when colorbuffer (gl-bind-renderbuffer GL-RENDERBUFFER colorbuffer))
+          (end-drawing)
+          (if (pos? (window-should-close))
+            (do (close-window) 0)
+            (recur state')))))))
+
+(defonce ^:private sdl-main-cb
+  (ffi/foreign-callable sdl-main [:int :pointer] :int :collect-safe))
+
+(defn run!
+  "Hand `scene` to UIKit and never return.
+  scene: {:title s, :init (fn [{:keys [width height scale]}] state), :frame (fn [state] state'), :fps n}"
+  [scene]
+  (reset! app scene)
+  (println "host: entering SDL_UIKitRunApp")
+  (ffi/with-c-string-array [argv 1] ["Hello"]
+    (sdl-uikit-run-app 1 argv sdl-main-cb)))
+#+end_src
+
+The scene: a marker under the finger, a ring where it last was, counters on
+screen, and the log.
+
+#+begin_src clojure :tangle ../../src/raylib/touch.clj :mkdirp true :comments link
+(ns raylib.touch
+  "examples/flappy milestone 3: RAY-010's scalar touch polling, on the host.
+  Press edges (touch count 0 → 1) and releases are counted and logged; the
+  console is the witness the simulator can no longer be."
+  (:require [raylib.host :as rl]))
+
+(defn- init [{:keys [scale]}]
+  {:k scale :touches 0 :presses 0 :releases 0 :held 0 :last nil})
+
+(defn- px [k v] (int (* k v)))
+
+(defn- frame [{:keys [k touches] :as s}]
+  (let [n         (rl/get-touch-point-count)
+        down?     (pos? n)
+        x         (rl/get-touch-x)
+        y         (rl/get-touch-y)
+        pressed?  (and down? (zero? touches))
+        released? (and (not down?) (pos? touches))
+        s         (cond-> (assoc s :touches n)
+                    down?     (assoc :last [x y])
+                    pressed?  (-> (update :presses inc) (assoc :held 0))
+                    down?     (update :held inc)
+                    released? (update :releases inc))]
+    (when pressed?
+      (println "touch: press" (:presses s) "at" x y "— GetTouchPosition" (rl/touch-position 0) "id" (rl/get-touch-point-id 0)))
+    (when released?
+      (println "touch: release" (:releases s) "after" (:held s) "frames, last" (:last s)))
+    (rl/clear-background rl/RAYWHITE)
+    (let [f (px k 20) m (px k 24)]
+      (rl/draw-text "touch me" m (px k 100) f rl/DARKGRAY)
+      (rl/draw-text (str "touches " n "  presses " (:presses s) "  releases " (:releases s)) m (px k 140) f rl/DARKGRAY)
+      (rl/draw-text (str "at " x "," y "   " (rl/get-fps) " fps") m (px k 180) f rl/DARKGRAY))
+    (when-let [[lx ly] (:last s)]
+      (rl/draw-circle-lines lx ly (* 40.0 k) rl/LIGHTGRAY))
+    (when down?
+      (rl/draw-circle x y (* 40.0 k) rl/MAROON)
+      (rl/draw-circle-lines x y (* 60.0 k) rl/DARKGRAY))
+    s))
+
+(defn -main [& _]
+  (rl/run! {:title "touch" :init init :frame frame}))
+#+end_src
+
+#+begin_example
+NS=raylib.touch TARGET=device sh scripts/raylib && jolt device      # then tap, drag, lift
+#+end_example
+
+** Met — a finger on the phone
+
+#+begin_example
+host: 402 x 874 points × scale 3.0 → screen 1206 x 2622 drawable 1206 x 2622 fbo 1
+touch: press 1 at 405 1375 — GetTouchPosition [405.0 1375.0001220703125] id 1211247552
+touch: release 1 after 13 frames, last [405 1375]
+touch: press 2 at 895 1177 — GetTouchPosition [895.0 1177.0] id 1211247552
+touch: release 2 after 658 frames, last [443 910]
+touch: press 3 at 384 1074 — GetTouchPosition [384.0 1074.0] id 1211247552
+touch: release 3 after 36 frames, last [471 1153]
+#+end_example
+
+Read top to bottom: the hand-rolled HighDPI works — a 1206×2622 screen over a
+1206×2622 drawable, so raylib's default font finally renders at the panel's
+resolution; a tap is a 13-frame press; press 2 is a drag, 658 frames from
+=895,1177= to =443,910=, the marker following the finger the whole way; and
+=GetTouchPosition= — a =Vector2= returned /by value/, through libffi, on
+portable bytecode, sixty times a second — agrees with =GetTouchX=/=GetTouchY=
+to the float. Milestone 0's probe was not a special case.
+
+One thing kept as found: =GetTouchPointId= answers =1211247552= for every
+touch. raylib's SDL platform stores SDL's 64-bit =SDL_FingerID= — on iOS a
+pointer-shaped value — in an =int=; the truncation is stable, and useless for
+telling fingers apart. RAY-010 leaned on point-zero coordinates rather than
+ids, and so does this.
