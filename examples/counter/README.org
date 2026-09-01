@@ -213,24 +213,30 @@ check). Everything past =accept= — bencode, sessions, eval — is jolt's.
 (def ^:private SOL-SOCKET 0xffff)     ; Darwin (Linux: 1)
 (def ^:private SO-REUSEADDR 4)        ; Darwin (Linux: 2)
 
+;; jolt 0.8.0 swapped ffi/write's value and offset (README.org, "jolt 0.8.0: the
+;; write order"). A layout + write-field spells the struct the same on both.
+(def ^:private sockaddr-in
+  (ffi/layout [:struct [[:len :uint8] [:family :uint8] [:port-hi :uint8] [:port-lo :uint8]
+                        [:a0 :uint8] [:a1 :uint8] [:a2 :uint8] [:a3 :uint8] [:zero :uint64]]]))
+(def ^:private int-l (ffi/layout [:struct [[:v :int]]]))
+
 (defn- sockaddr
   "struct sockaddr_in, Darwin layout: sin_len, sin_family, port (BE), then the
-  address — 127.0.0.1 for :loopback, 0.0.0.0 for :any (Wi-Fi: opt-in only)."
+  address — 127.0.0.1 for :loopback, 0.0.0.0 for :any (Wi-Fi: opt-in only).
+  Every field is written, so nothing depends on alloc zeroing."
   [port bind]
-  (let [sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
-    (ffi/write sa :uint8 0 16)
-    (ffi/write sa :uint8 1 AF-INET)
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))
-    (ffi/write sa :uint8 3 (bit-and port 0xff))
-    (when (= bind :loopback)
-      (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 7 1))   ; :any leaves 0.0.0.0
+  (let [sa        (ffi/alloc 16)
+        loopback? (= bind :loopback)]
+    (doseq [[k v] [[:len 16] [:family AF-INET]
+                   [:port-hi (bit-and (bit-shift-right port 8) 0xff)] [:port-lo (bit-and port 0xff)]
+                   [:a0 (if loopback? 127 0)] [:a1 0] [:a2 0] [:a3 (if loopback? 1 0)] [:zero 0]]]
+      (ffi/write-field sa sockaddr-in k v))
     sa))
 
 (defn- listen! [port bind]
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
     (when (neg? fd) (throw (ex-info "socket() failed" {:port port})))
-    (let [opt (ffi/alloc 4)] (ffi/write opt :int 0 1) (c-setsockopt fd SOL-SOCKET SO-REUSEADDR opt 4) (ffi/free opt))
+    (let [opt (ffi/alloc 4)] (ffi/write-field opt int-l :v 1) (c-setsockopt fd SOL-SOCKET SO-REUSEADDR opt 4) (ffi/free opt))
     (let [sa (sockaddr port bind)
           r  (c-bind fd sa 16)]
       (ffi/free sa)
@@ -1512,21 +1518,27 @@ section's, unchanged.
 (defonce ^:private global-block-isa
   (delay (c-dlsym (c-dlopen "/usr/lib/libSystem.B.dylib" RTLD-NOW) "_NSConcreteGlobalBlock")))
 
+;; The Block ABI as layouts, written field by field: jolt 0.8.0 swapped ffi/write's
+;; value and offset, and write-field reads the same on both (README.org, "jolt 0.8.0").
+(def ^:private descriptor-l (ffi/layout [:struct [[:reserved :uint64] [:size :uint64]]]))
+(def ^:private block-l      (ffi/layout [:struct [[:isa :pointer] [:flags :int32] [:reserved :int32]
+                                                  [:invoke :pointer] [:descriptor :pointer]]]))
+
 (defonce ^:private descriptor
-  (delay (doto (ffi/alloc 16)
-           (ffi/write :uint64 0 0)
-           (ffi/write :uint64 8 32))))
+  (delay (doto (ffi/alloc (ffi/layout-size descriptor-l))
+           (ffi/write-field descriptor-l :reserved 0)
+           (ffi/write-field descriptor-l :size (ffi/layout-size block-l)))))
 
 (defn- make-block
   "A fresh global block around `invoke`. Never freed: the runtime reads its flags
   on release, after invoke has returned — 32 bytes per fetch, on purpose."
   []
-  (doto (ffi/alloc 32)
-    (ffi/write :pointer 0  @global-block-isa)
-    (ffi/write :int32   8  BLOCK-IS-GLOBAL)
-    (ffi/write :int32   12 0)
-    (ffi/write :pointer 16 invoke)
-    (ffi/write :pointer 24 @descriptor)))
+  (doto (ffi/alloc (ffi/layout-size block-l))
+    (ffi/write-field block-l :isa        @global-block-isa)
+    (ffi/write-field block-l :flags      BLOCK-IS-GLOBAL)
+    (ffi/write-field block-l :reserved   0)
+    (ffi/write-field block-l :invoke     invoke)
+    (ffi/write-field block-l :descriptor @descriptor)))
 
 ;; --- the session -------------------------------------------------------------
 (defonce ^:private session

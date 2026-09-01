@@ -158,10 +158,11 @@ to =xcrun= and =iproxy=. Noted, not pursued.
    assertions under =jolt test= (15 / 60 in all, from 11 / 41), playing on
    the iPhone; the simulator is skipped, since it cannot show GLES. See
    "Milestone 4".
-5. *Device on =pb=*, and the numbers: frame time on an iPhone 16 Pro
+5. +*Device on =pb=*, and the numbers: frame time on an iPhone 16 Pro
    interpreting bytecode, against the collector section's 45× loop figure —
    the first measurement in this notebook where the interpreter's cost might
-   actually be visible.
+   actually be visible.+ Met, 2026-09-01: it is not visible. Mean 17.03 ms,
+   worst 17.3 ms, 59 fps, window after window — vsync-bound. See "Milestone 5".
 
 Not on this list: the gesture layer beyond taps, audio, and raygui — see above.
 
@@ -489,9 +490,10 @@ esac
 # CoreHaptics/CoreMotion/GameController are the joystick driver's (milestone 2: raylib asks SDL_Init for game controllers)
 FRAMEWORKS="-framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework OpenGLES -framework Metal -framework CoreVideo -framework AVFoundation -framework CoreMotion -framework GameController -framework CoreHaptics"
 mkdir -p Hello.app
+RAYLIB_A="${RAYLIB_A:-$PACK/lib/libraylib.a}"   # RAYLIB_A=~/dev/raylib-ios-sim-sw/lib/libraylib.a: the software rasteriser (milestone 2, "the simulator")
 JOLT_TARGET_CC=clang \
 JOLT_TARGET_ARCH_FLAG="$ARCH" \
-JOLT_TARGET_LINK_LIBS="-Wl,-force_load,$PACK/lib/libSDL2.a -Wl,-force_load,$PACK/lib/libraylib.a -Wl,-export_dynamic -L$PACK/lib -llz4 -lz $EXTRA $FRAMEWORKS -lobjc -liconv -lm" \
+JOLT_TARGET_LINK_LIBS="-Wl,-force_load,$PACK/lib/libSDL2.a -Wl,-force_load,$RAYLIB_A -Wl,-export_dynamic -L$PACK/lib -llz4 -lz $EXTRA $FRAMEWORKS -lobjc -liconv -lm" \
   jolt build -m "$NS" -o Hello.app/Hello --target "$MACHINE" --target-pack "$PACK"
 rm -rf Hello.app/Hello.build Hello.app/_CodeSignature Hello.app/embedded.mobileprovision
 #+end_src
@@ -561,7 +563,12 @@ Colours travel as raylib-jlt's packed =:uint= (=r | g<<8 | b<<16 | a<<24=): a
 4-byte struct and a =uint32= occupy one register identically, and milestone 0
 says =[:by-value …]= is there when a real struct is needed.
 
-#+begin_src clojure :tangle ../../src/raylib/window.clj :mkdirp true :comments link
+(Superseded — =:tangle no= — by =raylib.host= in milestone 3, which is this
+spike with the scene factored out. Left as written, including its raw
+=ffi/write= calls, which jolt 0.8.0 would read backwards; the host does it
+with layouts.)
+
+#+begin_src clojure :tangle no
 (ns raylib.window
   "examples/flappy milestone 2: raylib's loop inside UIApplicationMain.
   SDL_UIKitRunApp is called :blocking with a :collect-safe foreign-callable as
@@ -804,6 +811,16 @@ simulator cannot show this. raylib 6.0 ships a software rasteriser
 Metal first. That would give the simulator a picture without GLES, at CPU
 cost, for a 402×874 2D game. Untried; the phone is the target and it works.
 
+(Tried, 2026-09-01, after milestone 5. raylib built with
+=-DOPENGL_VERSION=Software= into its own prefix, linked through =scripts/raylib='s
+=RAYLIB_A= knob: "RLSW: Software renderer initialized successfully", 59 fps,
+=SDL_GetWindowWMInfo= rightly refusing — there is no GL window — and the
+screen black. Then again with =SDL_FRAMEBUFFER_ACCELERATION=metal= set before
+=InitWindow=, so SDL's surface would present through Metal rather than a GLES
+texture: black. Two renderers, two presentation paths, one blank simulator;
+the phone shows both. The simulator is closed as a display for this example,
+and the hint stays in the host because it is right on the device too.)
+
 * Milestone 3: touch (2026-09-01)
 
 Two things read before writing, both from =rcore_desktop_sdl.c=:
@@ -856,6 +873,7 @@ in production — and every release prints how many frames the finger held.
 (ffi/defcfn gl-bind-framebuffer          "glBindFramebuffer"         [:uint :uint] :void)
 (ffi/defcfn gl-bind-renderbuffer         "glBindRenderbuffer"        [:uint :uint] :void)
 (ffi/defcfn msg-0d                       "objc_msgSend"              [:pointer :pointer] :double)   ; [UIScreen scale]
+(ffi/defcfn sdl-set-hint                 "SDL_SetHint"               [:string :string] :uint8)
 (def ^:private SDL-INIT-VIDEO 0x20)
 (def ^:private GL-FRAMEBUFFER 0x8D40)
 (def ^:private GL-RENDERBUFFER 0x8D41)
@@ -913,13 +931,18 @@ in production — and every release prints how many frames the finger held.
 
 (defn- screen-scale [] (msg-0d (u/objc-msg-send-0 (u/cls "UIScreen") (u/sel "mainScreen")) (u/sel "scale")))
 
+(def ^:private sdl-version-l (ffi/layout [:struct [[:major :uint8] [:minor :uint8] [:patch :uint8]]]))
+
 (defn- view-framebuffer
   "SDL's drawable FBO and colour renderbuffer for the current window, via
-  SDL_SysWMinfo (version @0, subsystem @4, uikit.framebuffer @16, colorbuffer @20)."
+  SDL_SysWMinfo (version @0, subsystem @4, uikit.framebuffer @16, colorbuffer @20).
+  Only the version is ours to write — SDL fills the rest — and it goes through a
+  layout, since jolt 0.8.0 swapped ffi/write's value and offset."
   []
   (ffi/with-alloc [info 128]
-    (dotimes [i 128] (ffi/write info :uint8 i 0))
-    (ffi/write info :uint8 0 2) (ffi/write info :uint8 1 32) (ffi/write info :uint8 2 10)   ; SDL 2.32.10
+    (ffi/write-field info sdl-version-l :major 2)
+    (ffi/write-field info sdl-version-l :minor 32)
+    (ffi/write-field info sdl-version-l :patch 10)                 ; SDL 2.32.10
     (if (pos? (sdl-get-window-wm-info (sdl-gl-get-current-window) info))
       {:framebuffer (ffi/read info :uint32 16) :colorbuffer (ffi/read info :uint32 20)}
       (do (println "host: SDL_GetWindowWMInfo failed:" (sdl-get-error)) {}))))
@@ -936,6 +959,7 @@ in production — and every release prints how many frames the finger held.
         w       (int (* pw k))
         h       (int (* ph k))]
     (set-config-flags FLAG-WINDOW-HIGHDPI)       ; SDL_WINDOW_ALLOW_HIGHDPI: a full-resolution drawable
+    (sdl-set-hint "SDL_FRAMEBUFFER_ACCELERATION" "metal")   ; the software rasteriser's surface: present through Metal, never GLES
     (init-window w h title)                      ; ...and a screen the same size, so raylib never scales
     (set-target-fps fps)
     (let [{:keys [framebuffer colorbuffer]} (view-framebuffer)]
@@ -944,15 +968,23 @@ in production — and every release prints how many frames the finger held.
           (sdl-gl-get-drawable-size (sdl-gl-get-current-window) dw dh)
           (println "host:" pw "x" ph "points × scale" k "→ screen" (get-screen-width) "x" (get-screen-height)
                    "drawable" (ffi/read dw :int 0) "x" (ffi/read dh :int 0) "fbo" framebuffer)))
-      (loop [state (init {:width w :height h :scale k})]
+      ;; milestone 5's numbers: every 300 frames, the mean and worst frame time
+      (loop [state (init {:width w :height h :scale k}) n 0 sum 0.0 worst 0.0]
         (begin-drawing)
         (when framebuffer (gl-bind-framebuffer GL-FRAMEBUFFER framebuffer))
         (let [state' (frame state)]
           (when colorbuffer (gl-bind-renderbuffer GL-RENDERBUFFER colorbuffer))
           (end-drawing)
-          (if (pos? (window-should-close))
-            (do (close-window) 0)
-            (recur state')))))))
+          (let [dt    (get-frame-time)
+                n     (inc n)
+                sum   (+ sum dt)
+                worst (max worst dt)]
+            (when (zero? (mod n 300))
+              (println (format "host: %d frames, mean %.2f ms, worst %.1f ms, %d fps"
+                               n (* 1000.0 (/ sum 300)) (* 1000.0 worst) (get-fps))))
+            (if (pos? (window-should-close))
+              (do (close-window) 0)
+              (recur state' n (if (zero? (mod n 300)) 0.0 sum) (if (zero? (mod n 300)) 0.0 worst)))))))))
 
 (defonce ^:private sdl-main-cb
   (ffi/foreign-callable sdl-main [:int :pointer] :int :collect-safe))
@@ -1387,3 +1419,28 @@ loses its "potentially".
 Host side, =jolt test= went from 11 tests / 41 assertions to 15 / 60: their
 four =deftest=​s and nineteen assertions, unchanged, green under this
 project's runner.
+
+* Milestone 5: the numbers (2026-09-01)
+
+The host prints a summary every 300 frames — mean and worst =GetFrameTime=,
+and raylib's own =GetFPS= — and Flappy Bird is the workload: three pipes,
+a bird, a line of text, the sim's =step= in Clojure every frame, every draw
+call a libffi call. The iPhone 16 Pro, portable bytecode, mid-game:
+
+#+begin_example
+host:  300 frames, mean 19.37 ms, worst 721.0 ms, 59 fps      ← the first window: launch is in it
+host: 1200 frames, mean 17.04 ms, worst  17.3 ms, 59 fps
+host: 1500 frames, mean 17.03 ms, worst  17.3 ms, 59 fps
+host: 1800 frames, mean 17.05 ms, worst  17.3 ms, 59 fps
+host: 2100 frames, mean 17.03 ms, worst  17.2 ms, 59 fps
+#+end_example
+
+A 60 Hz panel's frame is 16.67 ms; a mean of 17.03 with a /worst/ of 17.3 is
+a loop that finishes its work and waits for vsync, every frame, with no
+outliers at all. The collector section measured this interpreter at 45× native
+on an arithmetic loop and 10–15× on allocation. Here, with the GPU and the
+display setting the pace, the 45× is inside the slack: the sim, the reducer,
+the twenty-odd FFI calls per frame and the collector all fit in a frame with
+room to spare. The first honest number where =pb='s cost /could/ have shown,
+and it did not. (The 721 ms in the first window is =InitWindow= — shader
+compiles, the default font — landing inside the first 300-frame average.)

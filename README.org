@@ -17,6 +17,27 @@ worth making, and will accrete the experiment as it happens, in the same
 literate style as the macOS demo: prose first, mistakes kept, code tangled
 from this document once there is code to tangle.
 
+* What it does, so far (2026-09-01)
+
+Two days in, on an iPhone 16 Pro, on portable bytecode with no JIT:
+
+#+caption: Flappy Bird — the Android experiment's pure =flappy_bird.cljc=, byte-identical, under a thirty-line iOS owner loop over raylib 6.0 and SDL2, at 60 fps. Recorded on the phone; =media/flappy.mp4= is the full-resolution video. ([[file:examples/flappy/README.org][examples/flappy]])
+[[file:media/flappy.gif]]
+
+#+caption: raylib's first frame on the phone: its default font and a =DrawCircle=, drawn by a jolt =while= loop inside =UIApplicationMain=. The simulator can no longer display OpenGL ES at all, so every raylib picture here is hardware.
+[[file:media/raylib.png]]
+
+#+caption: The counter — the macOS demo's view, character for character, over the glimmer seam on UIKit. (=media/counter.mp4= for Slack and the web.) ([[file:examples/counter/README.org][examples/counter]])
+[[file:media/counter.gif]]
+
+#+caption: The app as data: the same shell, its UI fetched as EDN from a server and negotiated by =Accept-Language= — French here, because the phone asked. Labels travel; the action vocabulary stays in code.
+[[file:media/wire-fr.png]]
+
+Everything above is tangled from these notebooks: the counter and the wire
+from [[file:examples/counter/README.org][examples/counter]], the bird from [[file:examples/flappy/README.org][examples/flappy]], the backend from
+[[file:glimmer-ios/core.org][glimmer-ios/]]. The rest of this file is how it got there, in order,
+mistakes included.
+
 * Research findings (2026-08-30)
 
 ** Chez officially targets iOS
@@ -1659,6 +1680,48 @@ a =JetsamEvent= log, or =idevicecrashreport= over a cable.
 Upstream, for cisco/ChezScheme: =TARGET_OS_SIMULATOR= should take the
 =MAP_JIT= path; the patch above is the whole change.
 
+* jolt 0.8.0: the write order (2026-09-01)
+
+Dmitri flagged the [[https://github.com/jolt-lang/jolt/blob/main/CHANGELOG.md#changed][0.8.0 CHANGELOG]] the day after it shipped, and it has a
+breaking change aimed squarely at this notebook: =ffi/write= now takes the
+value /before/ the offset — =(write p t v offset)=, babashka.ffi's order — where
+0.7.x took =(write p t offset v)=. Both arguments are integers, so the old
+spelling does not fail on the new runtime; it writes the wrong byte to the
+wrong place, silently. This machine still runs 0.7.29 (the tap has not moved),
+which is exactly the window in which to fix it, before an upgrade turns five
+namespaces into heisenbugs.
+
+The fix is not to swap arguments — that would break on 0.7.29 the way the old
+order breaks on 0.8.0 — but to stop spelling structs as offsets at all.
+=ffi/layout= and =ffi/write-field= are unchanged in both versions, so every raw
+=write= in the tree became a named field of a layout, and every field is
+written so nothing depends on 0.8.0's other change, zeroed =alloc=:
+
+- =demo.repl= — =sockaddr_in= as nine fields; the =setsockopt= flag as a
+  one-field struct.
+- =demo.http= — the Block ABI as two layouts (=block-l=, =descriptor-l=), and
+  =layout-size= instead of the literal 32.
+- =glimmer-ios.core= — =CFRunLoopSourceContext= as ten pointer-sized fields
+  instead of nine zeroed offsets and a =perform= at 72.
+- =raylib.host= — only =SDL_SysWMinfo='s version bytes, through a three-field
+  layout; SDL writes the rest.
+- =raylib.window=, the superseded spike, is =:tangle no= now and keeps its raw
+  writes as the record of how it was.
+
+Verified after the rewrite, still on 0.7.29: the simulator's wire app
+listened on its layout-built =sockaddr= (nREPL answered), fetched through the
+layout-built block (=wire: rendered=) and redrew through the layout-built
+run-loop source; the phone's Flappy Bird found SDL's framebuffer (=fbo 1=)
+through the three-field version layout. Same bytes in memory, spelled by name.
+
+Three other 0.8.0 lines matter here. *A portable-bytecode build reported
+itself as Linux, wherever it was running* — that is milestone 1's =os.name=
+finding, filed from this notebook and fixed; with it, =sa-arch= and
+=sa-endian= answer for =pb=. *=:bool=, a one-byte C boolean* — the =:uint8=
+that milestone 3's spike learned to use for =BOOL= has a name now. And
+*=:jolt/min-version=* — this project will declare =0.8.0= once Homebrew
+carries it; until then the code above runs correctly on either.
+
 * Upstream
 
 Findings that belong to other repositories, written to be pasted into
@@ -1672,6 +1735,8 @@ Findings that belong to other repositories, written to be pasted into
   a =sockaddr_in= without =sin_len=) and =socket()= returns EINVAL — this
   notebook had to own its listener. Proposed: =sa-os-family= treats =*ios=
   as Darwin; =os.name= "iOS"; =os.arch= "aarch64" regardless of backend.
+  (Fixed in jolt 0.8.0 — "a portable-bytecode build reported itself as
+  Linux, wherever it was running", 2026-08-31.)
 - *jolt: =make-pack.sh= and =pb= packs* — a =pb= kernel built
   =--enable-libffi= needs =libffi.a= in the pack and =-lffi= in =link-libs=;
   the script knows neither. The iOS recipe copies it in by hand.
@@ -1679,6 +1744,30 @@ Findings that belong to other repositories, written to be pasted into
   which jolt maps to a Scheme character ("invalid return value 1"); a =BOOL=
   is =:uint8=. And the scheduler's deref-then-=reset!= drain can lose a
   concurrent post; =swap-vals!= is the CAS form (glitter-uikit's P3.T2).
+
+From [[file:examples/flappy/README.org][examples/flappy]] (2026-09-01):
+
+- *raylib: the SDL platform never binds SDL's drawable framebuffer* — iOS
+  has no framebuffer 0; SDL's =README-ios= requires =uikit.framebuffer= bound
+  while rendering and =uikit.colorbuffer= at swap, both from =SDL_SysWMinfo=.
+  =rcore_desktop_sdl.c= draws into 0, which the simulator silently accepts and
+  a device would not. One =SDL_GetWindowWMInfo= after =SDL_GL_CreateContext=,
+  and a bind per frame, is the whole fix. Casualty: milestone 2's black screen.
+- *raylib: =CUSTOMIZE_BUILD= reads =#define SUPPORT_X 0= as ON* — the
+  =config.h= parser behind it keys on the =#define=, not the value, so
+  =SUPPORT_CUSTOM_FRAME_CONTROL= and =SUPPORT_BUSY_WAIT_LOOP= (and a dozen
+  file formats) flip on for anyone who customises anything. Casualty: an
+  =EndDrawing= that swapped, timed and polled nothing.
+- *raylib: =GetTouchPointId= truncates =SDL_FingerID=* — a 64-bit,
+  pointer-shaped value on iOS, stored in an =int=; every finger reports
+  =1211247552=. Cosmetic until someone needs multi-touch.
+- *raylib: =FLAG_WINDOW_HIGHDPI= "is not supported on PLATFORM_DESKTOP_SDL"* —
+  it still asks SDL for a high-DPI drawable, then sets =render = screen=. The
+  notebook sizes the screen in pixels by hand; the platform could do the same
+  from =SDL_GL_GetDrawableSize=.
+- *Apple: the iOS 17.5+ simulator does not display OpenGL ES* — pixels reach
+  the framebuffer (=glReadPixels= says so) and =CAEAGLLayer= shows black;
+  hardware is fine. Known ([[https://developer.apple.com/forums/thread/803483][forums thread 803483]]); not a bug anyone will fix.
 
 * TODO
 
