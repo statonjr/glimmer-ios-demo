@@ -1801,6 +1801,47 @@ that milestone 3's spike learned to use for =BOOL= has a name now. And
 *=:jolt/min-version=* — this project will declare =0.8.0= once Homebrew
 carries it; until then the code above runs correctly on either.
 
+* App Store rule 2.5.2, verbatim (2026-09-01)
+
+This notebook has cited 2.5.2 twice from memory — in the W^X section ("permits
+interpreting code bundled with the app") and in [[file:examples/counter/README.org][examples/counter]]'s proof of
+the app as data. Before anything gets posted on the strength of it, the text
+itself, from [[https://developer.apple.com/app-store/review/guidelines/][developer.apple.com/app-store/review/guidelines]] as fetched today:
+
+#+begin_quote
+2.5.2 Apps should be self-contained in their bundles, and may not read or
+write data outside the designated container area, nor may they download,
+install, or execute code which introduces or changes features or
+functionality of the app, including other apps. Educational apps designed to
+teach, develop, or allow students to test executable code may, in limited
+circumstances, download code provided that such code is not used for other
+purposes. Such apps must make the source code provided by the app completely
+viewable and editable by the user.
+#+end_quote
+
+Two corrections to the memory. It does not say "permits interpreting"; it
+says /self-contained/ and /may not download, install, or execute code/. And
+the clause many people remember — "the only exception is code run by Apple's
+built-in WebKit framework or JavaScriptCore, provided it doesn't provide
+access to native APIs" — is no longer in it. That clause was what
+React-Native-style over-the-air JavaScript stood on, and its absence is why
+the wire's argument must not be "it is like JavaScript."
+
+The argument is the one the code already makes. The bundle is self-contained:
+the interpreter, the widget set and the action vocabulary all shipped through
+review. What arrives over the wire is data — EDN, read by =clojure.edn=,
+validated by spec against a closed set of kinds — and nothing in it can
+extend what the app is able to do, only choose among things it already could:
+a news app downloading articles, a browser downloading a page. The
+demonstration's own line holds: nothing here can turn EDN into code. The one
+feature that /does/ execute downloaded code is the nREPL, which is why every
+notebook calls it dev-only; a shipped build would carry no listener.
+
+That is a reading, not a ruling — the line between data that changes what an
+app shows and code that changes what it does is exactly the one 2.5.2 leaves
+to a reviewer — and "self-contained, no new capabilities" is the strongest
+ground the rule offers to stand on.
+
 * Upstream
 
 Findings that belong to other repositories, written to be pasted into
