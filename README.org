@@ -32,6 +32,15 @@ the phone (=media/flappy.mp4= is the full-resolution video).
 
 [[file:media/flappy-small.gif]]
 
+** The gallery
+
+The Android experiment's scene contract, cards and input normalisation,
+byte-identical, under one iOS host — with Following Eyes and Touch Trail
+alongside the bird. Tap a card; Back returns.
+→ [[file:examples/gallery/README.org][examples/gallery]]
+
+[[file:media/gallery-small.png]] [[file:media/eyes-small.png]] [[file:media/trail-small.png]]
+
 ** raylib's first frame
 
 Its default font and a =DrawCircle=, drawn by a jolt =while= loop inside
@@ -867,7 +876,7 @@ plist is tangled, the binary is built, nothing in it is source.
   <key>CFBundleIdentifier</key>        <string>dev.statonsoftware.glimmer-ios.hello</string>
   <key>CFBundleExecutable</key>        <string>Hello</string>
   <key>CFBundleName</key>              <string>Hello</string>
-  <key>CFBundleDisplayName</key>       <string>Counter</string>   <!-- the tile's label; the bundle stays Hello.app -->
+  <key>CFBundleDisplayName</key>       <string>Gallery</string>   <!-- the tile's label (was Counter until examples/gallery); the bundle stays Hello.app -->
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleVersion</key>           <string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
@@ -1885,9 +1894,11 @@ done:
    [[file:examples/flappy/README.org][examples/flappy]]. The Android experiment's pure =flappy_bird.cljc=
    unchanged, an iOS owner loop underneath; raylib static in the pack, SDL as
    the platform layer raylib lacks. Research written 2026-08-31; milestones
-   0–4 met by 2026-09-01 — their =flappy_bird.cljc=, byte-identical, playing
-   on the iPhone 16 Pro. Left: the device numbers (milestone 5), and the
-   simulator, which can no longer display OpenGL ES at all.
+   0–5 met by 2026-09-01 — their =flappy_bird.cljc=, byte-identical, playing
+   on the iPhone 16 Pro at a vsync-bound 17 ms. The simulator can no longer
+   display OpenGL ES at all. Then [[file:examples/gallery/README.org][examples/gallery]]: their scene contract, cards,
+   input normalisation and two more scenes (Following Eyes, Touch Trail),
+   all unchanged, under one iOS host — the app's tile says Gallery now.
 
 Not on the list, on purpose: a gesture layer (raylib's touch work has no
 analogue when =UIButton= is the input), and a second UI shape.

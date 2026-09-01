@@ -896,7 +896,35 @@ in production — and every release prints how many frames the finger held.
 (ffi/defcfn get-screen-height   "GetScreenHeight"   [] :int)
 (ffi/defcfn get-frame-time      "GetFrameTime"      [] :float)
 (ffi/defcfn get-fps             "GetFPS"            [] :int)
+(ffi/defcfn measure-text        "MeasureText"       [:string :int] :int)
+(ffi/defcfn sdl-get-display-usable-bounds "SDL_GetDisplayUsableBounds" [:int :pointer] :int)   ; iOS: the safe area
 (def FLAG-WINDOW-HIGHDPI 0x2000)
+
+(defn- safe-area-top
+  "The status bar / Dynamic Island inset in points, from SDL's usable bounds
+  (an SDL_Rect {int x, y, w, h}; y is the top inset). 0 if SDL cannot say —
+  which it cannot before the window has been laid out (see safe-area-insets)."
+  []
+  (ffi/with-alloc [r 16]
+    (if (zero? (sdl-get-display-usable-bounds 0 r)) (ffi/read r :int 4) 0)))
+
+;; UIEdgeInsets {double top, left, bottom, right}: a four-double HFA, returned in
+;; registers — the by-value return milestone 0 proved through libffi.
+(ffi/defcfn msg-0-insets "objc_msgSend" [:pointer :pointer]
+  [:by-value [:struct [[:top :double] [:left :double] [:bottom :double] [:right :double]]]])
+(def ^:private insets-l (ffi/layout [:struct [[:top :double] [:left :double] [:bottom :double] [:right :double]]]))
+
+(defn safe-area-insets
+  "[[UIApplication sharedApplication].windows firstObject].safeAreaInsets, in
+  points: {:top :left :bottom :right}. Ask from inside the loop — insets are
+  only real once the window has been laid out, i.e. after the first frame."
+  []
+  (let [win (u/objc-msg-send-0
+              (u/objc-msg-send-0 (u/objc-msg-send-0 (u/cls "UIApplication") (u/sel "sharedApplication")) (u/sel "windows"))
+              (u/sel "firstObject"))]
+    (ffi/with-layout [i insets-l]
+      (msg-0-insets i win (u/sel "safeAreaInsets"))
+      (into {} (for [f [:top :left :bottom :right]] [f (ffi/read-field i insets-l f)])))))
 
 ;; --- raylib: touch (RAY-010's scalar surface, plus the by-value Vector2) ----
 (ffi/defcfn get-touch-point-count "GetTouchPointCount" [] :int)
@@ -967,9 +995,10 @@ in production — and every release prints how many frames the finger held.
         (ffi/with-alloc [dh 4]
           (sdl-gl-get-drawable-size (sdl-gl-get-current-window) dw dh)
           (println "host:" pw "x" ph "points × scale" k "→ screen" (get-screen-width) "x" (get-screen-height)
-                   "drawable" (ffi/read dw :int 0) "x" (ffi/read dh :int 0) "fbo" framebuffer)))
+                   "drawable" (ffi/read dw :int 0) "x" (ffi/read dh :int 0) "fbo" framebuffer
+                   "safe-area top" (safe-area-top) "pt")))
       ;; milestone 5's numbers: every 300 frames, the mean and worst frame time
-      (loop [state (init {:width w :height h :scale k}) n 0 sum 0.0 worst 0.0]
+      (loop [state (init {:width w :height h :scale k :inset-top (int (* k (safe-area-top)))}) n 0 sum 0.0 worst 0.0]
         (begin-drawing)
         (when framebuffer (gl-bind-framebuffer GL-FRAMEBUFFER framebuffer))
         (let [state' (frame state)]
@@ -1345,7 +1374,10 @@ because that is where the simulator would have been.
         (pos? n)                         :down
         :else                            :idle))
 
-(defn- draw! [{:keys [k game]} m]
+(defn draw-game!
+  "Draw one game state at scale k for metrics m. Public: examples/gallery draws
+  the same scene through the contract's draw-scene!."
+  [k game m]
   (let [{:keys [height bird-x bird-radius pipe-width gap-height]} (flappy/dimensions m)
         px (fn [v] (int (* k v)))]
     (rl/clear-background rl/SKYBLUE)
@@ -1357,6 +1389,8 @@ because that is where the simulator would have been.
     (rl/draw-text (str "score " (:score game) "   " (rl/get-fps) " fps") (px 24) (px 80) (px 20) rl/DARKGRAY)
     (when (:over? game)
       (rl/draw-text "GAME OVER - TAP TO RESTART" (px 24) (int (/ height 2.0)) (px 22) rl/MAROON))))
+
+(defn- draw! [{:keys [k game]} m] (draw-game! k game m))
 
 (defn- frame [{:keys [touches game] :as s}]
   (let [m     (metrics)
